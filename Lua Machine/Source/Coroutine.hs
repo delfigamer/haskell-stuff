@@ -1,9 +1,11 @@
+{-# LANGUAGE RankNTypes #-}
+
+
 module Coroutine (
     CoroutineT(..),
     raise,
     yield,
     try,
-    -- mapLiftT,
 ) where
 
 
@@ -14,7 +16,7 @@ import Control.Monad.Trans
 data CoroutineT a b e m t
     = Pure t
     | Error e
-    | Hold b (Either e a -> CoroutineT a b e m t)
+    | Hold b (a -> CoroutineT a b e m t)
     | Lift (m (CoroutineT a b e m t))
 
 
@@ -23,10 +25,7 @@ raise e = Error e
 
 
 yield :: b -> CoroutineT a b e m a
-yield y = Hold y (\next ->
-    case next of
-        Left e -> Error e
-        Right x -> Pure x)
+yield y = Hold y (\x -> Pure x)
 
 
 try :: (Monad m) => CoroutineT a b e m t -> CoroutineT a b e m (Either e t)
