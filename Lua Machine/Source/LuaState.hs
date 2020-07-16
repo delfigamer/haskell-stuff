@@ -8,6 +8,7 @@
 {-# LANGUAGE UndecidableInstances #-}
 {-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE GADTs #-}
+{-# LANGUAGE TypeOperators #-}
 
 
 module LuaState (
@@ -107,7 +108,10 @@ data LuaMetatable q s t = LuaMetatable {
     lmtCall
         :: Maybe (t q s
         -> [LuaValue q s]
-        -> LuaState q s [LuaValue q s])}
+        -> LuaState q s [LuaValue q s]),
+    lmtClose
+        :: Maybe (t q s
+        -> LuaState q s ())}
 
 
 lvalEmptyMetatable :: (Typeable t) => LuaMetatable q s t
@@ -118,7 +122,7 @@ lvalEmptyMetatable
         Nothing
         Nothing Nothing Nothing Nothing Nothing Nothing Nothing Nothing
         Nothing Nothing Nothing Nothing Nothing Nothing Nothing Nothing
-        Nothing Nothing Nothing Nothing Nothing Nothing
+        Nothing Nothing Nothing Nothing Nothing Nothing Nothing
 
 
 newtype LuaId = LuaId Int deriving (Show, Eq, Ord)
@@ -150,6 +154,9 @@ data LuaThreadState q s
 
 
 type LuaThread q s = STRef s (LuaThreadState q s)
+
+
+newtype LuaPure t q s = LuaPure t deriving (Show)
 
 
 data LuaValue q s where
@@ -266,6 +273,15 @@ errWrongResume typename
     = LString $ BSt.concat [
         "Attempt to resume a ", typename]
 
+errWrongMetatableOwner :: BSt.ByteString -> LuaValue q s
+errWrongMetatableOwner typename
+    = LString $ BSt.concat [
+        "Attempt to set a metatable for a ", typename]
+
+errWrongMetatableValue :: LuaValue q s
+errWrongMetatableValue = LString $
+    "Attempt to set a non-table value as a metatable"
+
 errWrongTable :: BSt.ByteString -> LuaValue q s
 errWrongTable typename
     = LString $ BSt.concat ["Attempt to index a ", typename]
@@ -285,7 +301,8 @@ data LuaEnvironment q s = LuaEnvironment {
     lenvNumberMetatable :: STRef s (LuaMetatable q s LuaValue),
     lenvStringMetatable :: STRef s (LuaMetatable q s LuaValue),
     lenvFunctionMetatable :: STRef s (LuaMetatable q s LuaValue),
-    lenvThreadMetatable :: STRef s (LuaMetatable q s LuaValue)}
+    lenvThreadMetatable :: STRef s (LuaMetatable q s LuaValue),
+    lenvWarnHandler :: STRef s (LuaValue q s -> LuaState q s ())}
 
 
 type LuaTraceback q s = [String]
@@ -345,6 +362,7 @@ lxRunT resolveST resolveIO resolveYield onError onPure (LuaState act) = do
         <*> newSTRef lvalEmptyMetatable
         <*> newSTRef lvalEmptyMetatable
         <*> newSTRef lvalEmptyMetatable
+        <*> (newSTRef =<< makeDefaultWarnHandler)
     thread <- resolveST $ newSTRef LTRunning
     driveY $ runReaderT act (LuaContext env [] return thread)
     where
@@ -405,6 +423,29 @@ instance Applicative (LuaState q s) where
     LuaState sta <*> LuaState stb = LuaState $ sta <*> stb
 
 
+makeDefaultWarnHandler :: ST s (LuaValue q s -> LuaState q s ())
+makeDefaultWarnHandler = do
+    isActiveRef <- newSTRef True
+    return (\a ->
+        case a of
+            LString msg -> processWarnMsg isActiveRef msg
+            _ -> return ())
+    where
+    processWarnMsg isActiveRef msg
+        | msg == "@off" = lxWrite isActiveRef $ False
+        | msg == "@on" = lxWrite isActiveRef $ True
+        | "@" `BSt.isPrefixOf` msg = return ()
+        | otherwise = do
+            isActive <- lxRead isActiveRef
+            if isActive
+                then do
+                    let msgStr = (toEnum . fromEnum) <$> BSt.unpack msg
+                    lxTryLiftIO $ putStrLn $
+                        "Lua warning: " ++ msgStr
+                    return ()
+                else return ()
+
+
 lxYield :: [LuaValue q s] -> LuaState q s [LuaValue q s]
 lxYield bvals = do
     result <- LuaState $ lift $ Y.yield bvals
@@ -422,6 +463,30 @@ lxError err = do
 
 lxTry :: LuaState q s t -> LuaState q s (Either (LuaValue q s) t)
 lxTry (LuaState act) = LuaState $ mapReaderT Y.try $ act
+
+
+lxWarn :: LuaValue q s -> LuaState q s ()
+lxWarn e = do
+    env <- lctxEnvironment <$> ask
+    warnh <- lxRead $ lenvWarnHandler env
+    lxTry (warnh e)
+    return ()
+
+
+lxFinally :: LuaState q s () -> LuaState q s t -> LuaState q s t
+lxFinally fin act = do
+    ar <- lxTry act
+    fr <- lxTry fin
+    case ar of
+        Left ae -> do
+            case fr of
+                Left fe -> lxWarn fe
+                Right _ -> return $ ()
+            LuaState $ lift $ Y.raise ae
+        Right ar -> do
+            case fr of
+                Left fe -> LuaState $ lift $ Y.raise fe
+                Right _ -> return $ ar
 
 
 lxTracebackWithin :: String -> LuaState q s t -> LuaState q s t
@@ -611,7 +676,8 @@ lxProduceMetatable tvalue@(LTable _ table) = do
         lmtIndex = mkMetaopIndex <$!> M.lookup (LKString "__index") items,
         lmtNewIndex =
             mkMetaopNewIndex <$!> M.lookup (LKString "__newindex") items,
-        lmtCall = mkMetaopCall <$!> M.lookup (LKString "__call") items}
+        lmtCall = mkMetaopCall <$!> M.lookup (LKString "__call") items,
+        lmtClose = mkMetaopClose <$!> M.lookup (LKString "__close") items}
     return $ metatable
     where
     mkMetaopUnary f = \a -> lxCar <$> luaCall f [a]
@@ -630,6 +696,7 @@ lxProduceMetatable tvalue@(LTable _ table) = do
     mkMetaopNewIndex (LFunction _ ff) = \a b c -> () <$ ff [a, b, c]
     mkMetaopNewIndex f = \a b c -> luaSet f b c
     mkMetaopCall f = \a args -> luaCall f (a:args)
+    mkMetaopClose f = \a -> () <$ luaCall f [a]
 lxProduceMetatable _ = return $ lvalEmptyMetatable
 
 
@@ -1104,6 +1171,17 @@ luaCall a args = do
                     Nothing -> lxError $ errWrongCall (lvalTypename a))
 
 
+luaCloseAfter
+    :: LuaValue q s
+    -> LuaState q s t
+    -> LuaState q s t
+luaCloseAfter a act = do
+    lxMetatable a (\x mt ->
+        case lmtClose mt of
+            Just metaop -> lxFinally (metaop x) act
+            Nothing -> act)
+
+
 luaCompareLt a b = lxPerformBinary
     (lxRawCompare (<))
     lmtLt
@@ -1140,6 +1218,13 @@ luaCreateFunction fn = do
     return $ LFunction cnt fn
 
 
+luaCreatePureUserdata
+    :: t
+    -> LuaMetatable q s (LuaPure t)
+    -> LuaState q s (LuaValue q s)
+luaCreatePureUserdata px mt = luaCreateUserdata (LuaPure px) mt
+
+
 luaCreateTable
     :: [(LuaValue q s, LuaValue q s)]
     -> LuaState q s (LuaValue q s)
@@ -1169,6 +1254,14 @@ luaCreateUserdata x mt = do
 
 luaError :: LuaValue q s -> LuaState q s a
 luaError e = lxError e
+
+
+luaFromUserdata
+    :: LuaValue q s
+    -> (forall t . (Typeable t) => t q s -> LuaState q s u)
+    -> LuaState q s u
+luaFromUserdata a f = do
+    lxMetatable a (\x mt -> f x)
 
 
 luaGet
@@ -1230,18 +1323,6 @@ luaNewThread = luaCreateThread (\init -> do
         (LFunction _ f):args -> f args
         a:args -> lxError $ errWrongThreadFunc (lvalTypename a)
         _ -> lxError $ errWrongThreadFunc "nothing")
-
-
-luaNumberToInteger :: LuaValue q s -> Maybe Integer
-luaNumberToInteger (LInteger x) = Just x
-luaNumberToInteger (LRational x) =
-    if R.denominator x == 1
-        then Just $ R.numerator x
-        else Nothing
-luaNumberToInteger (LDouble x) =
-    if isNaN x || isInfinite x
-        then Nothing
-        else luaNumberToInteger $ LRational $ toRational x
 
 
 luaPCall
@@ -1373,13 +1454,107 @@ luaSet a b c = do
                 Nothing -> def)
 
 
--- luaSetMetatable
-    -- :: LuaValue q s
-    -- -> LuaValue q s
-    -- -> LuaState q s ()
--- luaSetMetatable a meta = do
-    -- case a of
-        -- LUserdata _ _ _ -> lxError
+luaSetMetatable
+    :: LuaValue q s
+    -> LuaValue q s
+    -> LuaState q s ()
+luaSetMetatable a meta = do
+    case a of
+        LTable _ table -> do
+            case meta of
+                LTable _ _ -> do
+                    LuaTableBody items _ <- lxRead table
+                    mt <- lxProduceMetatable meta
+                    lxWrite table $ LuaTableBody items mt
+                _ -> lxError $ errWrongMetatableValue
+        _ -> lxError $ errWrongMetatableOwner (lvalTypename a)
+
+
+luaToBoolean
+    :: LuaValue q s
+    -> Bool
+luaToBoolean (LBool b) = b
+luaToBoolean LNil = False
+luaToBoolean _ = True
+
+
+luaToDouble :: LuaValue q s -> Maybe Double
+luaToDouble (LInteger x) = Just $ fromInteger x
+luaToDouble (LRational x) = Just $ fromRational x
+luaToDouble (LDouble x) = Just $ x
+luaToDouble _ = Nothing
+
+
+luaToInteger :: LuaValue q s -> Maybe Integer
+luaToInteger (LInteger x) = Just x
+luaToInteger (LRational x) =
+    if R.denominator x == 1
+        then Just $ R.numerator x
+        else Nothing
+luaToInteger (LDouble x) =
+    if isNaN x || isInfinite x
+        then Nothing
+        else luaToInteger $ LRational $ toRational x
+luaToInteger _ = Nothing
+
+
+luaToFunction
+    :: LuaValue q s
+    -> Maybe (LuaFunction q s)
+luaToFunction (LFunction _ f) = Just f
+luaToFunction _ = Nothing
+
+
+luaToPureUserdata
+    :: (Typeable u)
+    => LuaValue q s
+    -> Maybe u
+luaToPureUserdata a = do
+    case luaToUserdata a of
+        Just (LuaPure px) -> px
+        Nothing -> Nothing
+
+
+luaToRational :: LuaValue q s -> Maybe Rational
+luaToRational (LInteger x) = Just $ fromInteger x
+luaToRational (LRational x) = Just $ x
+luaToRational (LDouble x) =
+    if isNaN x || isInfinite x
+        then Nothing
+        else Just $ toRational x
+luaToRational _ = Nothing
+
+
+luaToString
+    :: LuaValue q s
+    -> Maybe String
+luaToString x@(LInteger _) = Just $ show x
+luaToString x@(LRational _) = Just $ show x
+luaToString x@(LDouble _) = Just $ show x
+luaToString (LString b) = Just $ (toEnum . fromEnum) <$> BSt.unpack b
+luaToString _ = Nothing
+
+
+luaToThread
+    :: LuaValue q s
+    -> Maybe (LuaThread q s)
+luaToThread (LThread _ thread) = Just $ thread
+luaToThread _ = Nothing
+
+
+luaToUserdata
+    :: (Typeable u)
+    => LuaValue q s
+    -> Maybe (u q s)
+luaToUserdata a = do
+    case a of
+        LUserdata _ x mt -> lmtTypify mt hcast x
+        _ -> hcast a
+    where
+    hcastWith :: a q s -> (a :~~: b) -> b q s
+    hcastWith x HRefl = x
+    hcast :: (Typeable a, Typeable b) => a q s -> Maybe (b q s)
+    hcast x = hcastWith x <$> eqTypeRep typeRep typeRep
 
 
 luaTry
