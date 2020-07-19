@@ -27,6 +27,7 @@ import Data.Maybe
 import Data.String
 import Data.STRef
 import Type.Reflection
+import SourceRange (SourceRange)
 import qualified Data.Ratio as R
 import qualified Data.Map.Strict as M
 import qualified Data.ByteString as BSt
@@ -263,6 +264,10 @@ errWrongConcat tn1 tn2
     = LString $ BSt.concat [
         "Attempt to concatenate a ", tn1, " and a ", tn2]
 
+errWrongIO :: LuaValue q s
+errWrongIO = LString $
+    "Attempt to perform IO where it's unsupported"
+
 errWrongLen :: BSt.ByteString -> LuaValue q s
 errWrongLen typename
     = LString $ BSt.concat [
@@ -305,31 +310,62 @@ data LuaEnvironment q s = LuaEnvironment {
     lenvWarnHandler :: STRef s (LuaValue q s -> LuaState q s ())}
 
 
-type LuaTraceback q s = [String]
-
-
 type LuaErrorHandler q s = LuaValue q s -> LuaState q s (LuaValue q s)
+
+
+data LuaStackFrame q s = LuaStackFrame {
+    lsfFunction :: Maybe (LuaFunction q s),
+    lsfDefLocation :: Maybe SourceRange,
+    lsfCurrentLocation :: Maybe SourceRange,
+    lsfUpvalues :: [STRef s (LuaValue q s)],
+    lsfLocals :: [STRef s (LuaValue q s)]}
+
+
+lsfModifyCurrentLocation
+    :: (Maybe SourceRange -> Maybe SourceRange)
+    -> LuaStackFrame q s
+    -> LuaStackFrame q s
+lsfModifyCurrentLocation f (LuaStackFrame b d c u l)
+    = LuaStackFrame b d (f c) u l
+
+
+lsfModifyLocals
+    :: ([STRef s (LuaValue q s)] -> [STRef s (LuaValue q s)])
+    -> LuaStackFrame q s
+    -> LuaStackFrame q s
+lsfModifyLocals f (LuaStackFrame b d c u l)
+    = LuaStackFrame b d c u (f l)
 
 
 data LuaContext q s = LuaContext {
     lctxEnvironment :: LuaEnvironment q s,
-    lctxTraceback :: LuaTraceback q s,
     lctxErrHandler :: LuaErrorHandler q s,
-    lctxCurrentThread :: LuaThread q s}
-
-
-lctxModifyTraceback
-    :: (LuaTraceback q s -> LuaTraceback q s)
-    -> LuaContext q s
-    -> LuaContext q s
-lctxModifyTraceback f (LuaContext st tb eh cth) = LuaContext st (f tb) eh cth
+    lctxCurrentThread :: LuaThread q s,
+    lctxStack :: [LuaStackFrame q s]}
 
 
 lctxModifyErrHandler
     :: (LuaErrorHandler q s -> LuaErrorHandler q s)
     -> LuaContext q s
     -> LuaContext q s
-lctxModifyErrHandler f (LuaContext st tb eh cth) = LuaContext st tb (f eh) cth
+lctxModifyErrHandler f (LuaContext e h t s) = LuaContext e (f h) t s
+
+
+lctxModifyStack
+    :: ([LuaStackFrame q s] -> [LuaStackFrame q s])
+    -> LuaContext q s
+    -> LuaContext q s
+lctxModifyStack f (LuaContext e h t s) = LuaContext e h t (f s)
+
+
+lctxModifyStackTop
+    :: (LuaStackFrame q s -> LuaStackFrame q s)
+    -> LuaContext q s
+    -> LuaContext q s
+lctxModifyStackTop f = lctxModifyStack sf
+    where
+    sf (t:ts) = (f t):ts
+    sf [] = []
 
 
 newtype LuaState q s t = LuaState {
@@ -364,7 +400,7 @@ lxRunT resolveST resolveIO resolveYield onError onPure (LuaState act) = do
         <*> newSTRef lvalEmptyMetatable
         <*> (newSTRef =<< makeDefaultWarnHandler)
     thread <- resolveST $ newSTRef LTRunning
-    driveY $ runReaderT act (LuaContext env [] return thread)
+    driveY $ runReaderT act (LuaContext env return thread [])
     where
     driveY (Y.Pure x) = onPure x
     driveY (Y.Error e) = onError e
@@ -465,6 +501,13 @@ lxTry :: LuaState q s t -> LuaState q s (Either (LuaValue q s) t)
 lxTry (LuaState act) = LuaState $ mapReaderT Y.try $ act
 
 
+lxWithErrHandler
+    :: LuaErrorHandler q s
+    -> LuaState q s t
+    -> LuaState q s t
+lxWithErrHandler errh act = local (lctxModifyErrHandler (\_ -> errh)) $ act
+
+
 lxWarn :: LuaValue q s -> LuaState q s ()
 lxWarn e = do
     env <- lctxEnvironment <$> ask
@@ -487,10 +530,6 @@ lxFinally fin act = do
             case fr of
                 Left fe -> LuaState $ lift $ Y.raise fe
                 Right _ -> return $ ar
-
-
-lxTracebackWithin :: String -> LuaState q s t -> LuaState q s t
-lxTracebackWithin line act = local (lctxModifyTraceback (line:)) act
 
 
 lxLiftST :: ST s a -> LuaState q s a
@@ -528,7 +567,7 @@ lxNewThread body = do
             Left err -> Y.Error err
             Right args -> do
                 let (LuaState rm) = body args
-                let context = LuaContext env [] return thread
+                let context = LuaContext env return thread []
                 runReaderT rm context)
     lxWrite thread $ LTSuspended start
     return $ thread
@@ -1311,6 +1350,16 @@ luaLen a = do
                         _ -> lxError $ errWrongLen (lvalTypename a))
 
 
+luaLiftIO
+    :: IO t
+    -> LuaState q s t
+luaLiftIO act = do
+    mr <- lxTryLiftIO act
+    case mr of
+        Nothing -> lxError $ errWrongIO
+        Just r -> return $ r
+
+
 luaNewTable
     :: LuaState q s (LuaValue q s)
 luaNewTable = luaCreateTable []
@@ -1563,31 +1612,40 @@ luaTry
 luaTry = lxTry
 
 
-testPrintTraceback :: String -> LuaState q s ()
-testPrintTraceback header = do
-    tb <- lctxTraceback <$> ask
-    let str = intercalate " | " (header:(reverse tb))
-    lxTryLiftIO $ putStrLn $ str
-    return ()
+luaXPCall
+    :: LuaValue q s
+    -> LuaValue q s
+    -> [LuaValue q s]
+    -> LuaState q s (Either (LuaValue q s) [LuaValue q s])
+luaXPCall ha a args = luaXTry errh $ luaCall a args
+    where
+    errh e = lxCar <$> luaCall e [a]
+
+
+luaXTry
+    :: LuaErrorHandler q s
+    -> LuaState q s t
+    -> LuaState q s (Either (LuaValue q s) t)
+luaXTry errh act = do
+    lxWithErrHandler errh $ lxTry act
+
+
+luaYield
+    :: [LuaValue q s]
+    -> LuaState q s [LuaValue q s]
+luaYield = lxYield
 
 
 testfunc :: LuaState q s String
 testfunc = do
-    lxTracebackWithin "foo" (do
-        testPrintTraceback "A"
-        let lv = luaPush ("aaa" :: BSt.ByteString)
-        lxTry (do
-            lxTracebackWithin "bar" (do
-                lxTryLiftIO $ print lv
-                testPrintTraceback "B"
-                lxYield []
-                testPrintTraceback "C"))
-        testPrintTraceback "D"
-        let a = LInteger 10
-        let b = LString "asdf"
-        c <- luaArithAdd a b
-        testPrintTraceback "E"
-        return $ show c)
+    let lv = luaPush ("aaa" :: BSt.ByteString)
+    luaTry (do
+        luaLiftIO $ print lv
+        luaYield [])
+    let a = LInteger 10
+    let b = LString "asdf"
+    c <- luaArithAdd a b
+    return $ show c
 
 
 test' :: IO ()
