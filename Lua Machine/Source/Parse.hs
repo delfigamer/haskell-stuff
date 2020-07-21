@@ -13,6 +13,7 @@ import Data.Bits
 import Data.Function
 import Data.Int
 import Data.List (foldl')
+import Data.Maybe
 import Data.Ratio
 import Data.String
 import Data.STRef
@@ -876,6 +877,29 @@ defPrefixExpr d expr rest
     | otherwise = "(" $ defString d expr $ ")" $ rest
 
 
+isValidIdent :: BSt.ByteString -> Bool
+isValidIdent name = do
+    checkFirst (BSt.unpack name)
+    where
+    checkFirst (x:xs)
+        = True
+            && (False
+                || within 'a' 'z' x
+                || within 'A' 'Z' x
+                || x == byte '_')
+            && checkRest xs
+    checkFirst _ = False
+    checkRest [] = True
+    checkRest (x:xs)
+        = True
+            && (False
+                || within 'a' 'z' x
+                || within 'A' 'Z' x
+                || within '0' '9' x
+                || x == byte '_')
+            && checkRest xs
+
+
 instance DefString ExprNode where
     defString d (ExprNode (pr, ExprNil)) rest
         = "nil" $ rest
@@ -907,27 +931,10 @@ instance DefString ExprNode where
                 $ "[" $ defString d key $ "]" $ rest
         where
         identKey (ExprNode (_, ExprString str))
-            = if isValidIdent (BSt.unpack str) && not (str `elem` keywords)
+            = if isValidIdent str && not (str `elem` keywords)
                 then Just str
                 else Nothing
         identKey _ = Nothing
-        isValidIdent (x:xs)
-            = True
-                && (False
-                    || within 'a' 'z' x
-                    || within 'A' 'Z' x
-                    || x == byte '_')
-                && isValidIdentCont xs
-        isValidIdent _ = False
-        isValidIdentCont [] = True
-        isValidIdentCont (x:xs)
-            = True
-                && (False
-                    || within 'a' 'z' x
-                    || within 'A' 'Z' x
-                    || within '0' '9' x
-                    || x == byte '_')
-                && isValidIdentCont xs
     defString d (ExprNode (pr, ExprCall func args Nothing)) rest
         = defPrefixExpr d func $ "(" $ defList ", " d args $ ")" $ rest
     defString d (ExprNode (pr, ExprCall func args (Just last))) rest
@@ -1726,6 +1733,19 @@ gramSuffixExpr = do
         return $ (pr, [arg], Nothing)
 
 
+data IrSlot
+    = ISLocal Int
+    | ISConst Int
+    | ISGuard Int
+    deriving (Eq)
+
+
+instance DefString IrSlot where
+    defString d (ISLocal i) rest = "@" $ shows i $ rest
+    defString d (ISConst i) rest = "%" $ shows i $ rest
+    defString d (ISGuard i) rest = "&" $ shows i $ rest
+
+
 data IrAction t where
     IANil :: IrAction *
     IABool :: Bool -> IrAction *
@@ -1733,9 +1753,8 @@ data IrAction t where
     IARational :: Rational -> IrAction *
     IAString :: BSt.ByteString -> IrAction *
     IAEllipsis :: IrAction [*]
-    IANewTable :: IrAction *
-    IAArrayTable :: IrAction [*] -> IrAction *
-    IALocal :: Int -> IrAction *
+    IATable :: IrAction [*] -> [(IrAction *, IrAction *)] -> IrAction *
+    IASlot :: IrSlot -> IrAction *
     IAUpvalue :: Int -> IrAction *
     IAIndex :: IrAction * -> IrAction * -> IrAction *
     IACall :: IrAction * -> IrAction [*] -> IrAction [*]
@@ -1762,34 +1781,34 @@ data IrAction t where
     IABinaryGe :: IrAction * -> IrAction * -> IrAction *
     IABinaryEq :: IrAction * -> IrAction * -> IrAction *
     IABinaryNeq :: IrAction * -> IrAction * -> IrAction *
+    IARange
+        :: IrAction * -- init
+        -> IrAction * -- limit
+        -> IrAction * -- step
+        -> IrAction [*]
     IAEmpty :: IrAction [*]
     IACons :: IrAction * -> IrAction [*] -> IrAction [*]
     IACar :: IrAction [*] -> IrAction *
     IALNot :: IrAction * -> IrAction *
     IALAnd :: IrAction * -> IrAction * -> IrAction *
     IALOr :: IrAction * -> IrAction * -> IrAction *
-    IANewLocal
-        :: Maybe (SourceRange, BSt.ByteString) -- def location, source name
-        -> Int -- internal name
-        -> Bool -- needs closing
-        -> IrAction ()
     IASetLocal :: Int -> IrAction (* -> ())
     IASetUpvalue :: Int -> IrAction (* -> ())
     IASetIndex :: IrAction * -> IrAction * -> IrAction (* -> ())
     IASetNull :: IrAction (* -> ())
     IANull :: IrAction ()
     IAAssign :: IrAction [*] -> [IrAction (* -> ())] -> IrAction ()
+    IAOpen
+        :: IrAction [*]
+        -> [(Maybe (SourceRange, BSt.ByteString), IrSlot)]
+        -> IrAction ()
     IAInvoke :: IrAction [*] -> IrAction ()
     IASequence :: IrAction () -> IrAction [*] -> IrAction [*]
-    IADropBefore :: [(Int, Bool)] -> IrAction [*] -> IrAction [*]
-    IADropAfter :: IrAction [*] -> [(Int, Bool)] -> IrAction [*]
-    IATailCall :: IrAction * -> IrAction [*] -> [(Int, Bool)] -> IrAction [*]
+    IADropBefore :: [IrSlot] -> IrAction [*] -> IrAction [*]
+    IADropAfter :: IrAction [*] -> [IrSlot] -> IrAction [*]
+    IATailCall :: IrAction * -> IrAction [*] -> [IrSlot] -> IrAction [*]
     IATailCallMethod
-        :: IrAction *
-        -> IrAction *
-        -> IrAction [*]
-        -> [(Int, Bool)]
-        -> IrAction [*]
+        :: IrAction * -> IrAction * -> IrAction [*] -> [IrSlot] -> IrAction [*]
     IABranch :: IrAction * -> IrAction [*] -> IrAction [*] -> IrAction [*]
     IABlock :: Int -> IrAction [*]
     IAFunction
@@ -1798,6 +1817,10 @@ data IrAction t where
             Int,
             Either Int Int, -- Left outerupvalue | Right outerlocal
             Maybe (SourceRange, BSt.ByteString))] -- captured upvalues
+        -> [(
+            Int,
+            IrSlot,
+            Maybe (SourceRange, BSt.ByteString))] -- captured upconstants
         -> [(Int, Maybe (SourceRange, BSt.ByteString))] -- named arguments
         -> IrBody -- function body
         -> IrAction *
@@ -1819,18 +1842,6 @@ instance DefString IrBody where
             $ defBr d $ defString d (x:xs) $ rest
 
 
-defIraLocals :: Int -> [(Int, Bool)] -> ShowS
-defIraLocals d [] rest = rest
-defIraLocals d [(id, False)] rest
-    = "@" $ shows id $ rest
-defIraLocals d [(id, True)] rest
-    = "@" $ shows id $ " close" $ rest
-defIraLocals d ((id, False):x:xs) rest
-    = "@" $ shows id $ ", " $ defIraLocals d (x:xs) $ rest
-defIraLocals d ((id, True):x:xs) rest
-    = "@" $ shows id $ " close, " $ defIraLocals d (x:xs) $ rest
-
-
 instance DefString (IrAction a) where
     defString d IANil rest
         = "nil" $ rest
@@ -1845,22 +1856,28 @@ instance DefString (IrAction a) where
     defString d (IAString s) rest
         = shows s $ rest
     defString d IAEllipsis rest
-        = "..." $ rest
-    defString d IANewTable rest
-        = "{}" $ rest
-    defString d (IAArrayTable xs) rest
-        = defString d xs $ rest
-    defString d (IALocal id) rest
-        = "@" $ shows id $ rest
+        = "arguments" $ rest
+    defString d (IATable xs kvs) rest
+        = "(table {" $ defString d xs $ "} [" $ defKVs (d+1) kvs $ "])" $ rest
+        where
+        defKVs d [] rest = rest
+        defKVs d [(k, v)] rest
+            = defBr d $ defString d k $ " <- " $ defString d v
+                $ defBr d $ rest
+        defKVs d ((k, v):xs) rest
+            = defBr d $ defString d k $ " <- " $ defString d v $ ","
+                $ defKVs d xs $ rest
+    defString d (IASlot slot) rest
+        = defString d slot $ rest
     defString d (IAUpvalue id) rest
         = "$" $ shows id $ rest
     defString d (IAIndex table index) rest
         = "(index " $ defString d table $ " " $ defString d index $ ")" $ rest
     defString d (IACall func args) rest
-        = "(call " $ defString d func $ " " $ defString d args $ ")" $ rest
+        = "call " $ defString d func $ " {" $ defString d args $ "}" $ rest
     defString d (IACallMethod func index args) rest
-        = "(callmethod " $ defString d func $ " "
-            $ defString d index $ " " $ defString d args $ ")" $ rest
+        = "callmethod " $ defString d func $ " "
+            $ defString d index $ " {" $ defString d args $ "}" $ rest
     defString d (IAUnaryUnm a) rest
         = "(munm " $ defString d a $ ")" $ rest
     defString d (IAUnaryLen a) rest
@@ -1905,28 +1922,21 @@ instance DefString (IrAction a) where
         = "(meq " $ defString d a $ " " $ defString d b $ ")" $ rest
     defString d (IABinaryNeq a b) rest
         = "(mneq " $ defString d a $ " " $ defString d b $ ")" $ rest
+    defString d (IARange init limit step) rest
+        = "range " $ defString d init $ " " $ defString d limit
+            $ " " $ defString d step $ rest
     defString d IAEmpty rest
         = "empty" $ rest
     defString d (IACons x xs) rest
         = defString d x $ ", " $ defString d xs $ rest
     defString d (IACar xs) rest
-        = "(car " $ defString d xs $ ")" $ rest
+        = "(car {" $ defString d xs $ "})" $ rest
     defString d (IALNot a) rest
         = "(lnot " $ defString d a $ ")" $ rest
     defString d (IALAnd a b) rest
         = "(land " $ defString d a $ " " $ defString d b $ ")" $ rest
     defString d (IALOr a b) rest
         = "(lor " $ defString d a $ " " $ defString d b $ ")" $ rest
-    defString d (IANewLocal Nothing id False) rest
-        = "newlocal @" $ shows id $ ";" $ rest
-    defString d (IANewLocal Nothing id True) rest
-        = "newlocal @" $ shows id $ " close;" $ rest
-    defString d (IANewLocal (Just (pr, name)) id False) rest
-        = "newlocal @" $ shows id $ "; -- "
-            $ unpackSt name $ " " $ shows pr $ rest
-    defString d (IANewLocal (Just (pr, name)) id True) rest
-        = "newlocal @" $ shows id $ " close; -- "
-            $ unpackSt name $ " " $ shows pr $ rest
     defString d (IASetLocal id) rest
         = "=@" $ shows id $ rest
     defString d (IASetUpvalue id) rest
@@ -1939,24 +1949,34 @@ instance DefString (IrAction a) where
     defString d IANull rest
         = ";" $ rest
     defString d (IAAssign source targets) rest
-        = "assign " $ defString d source $ " ["
+        = "assign {" $ defString d source $ "} ["
             $ defList ", " d targets $ "];" $ rest
+    defString d (IAOpen source targets) rest
+        = "open {" $ defString d source $ "} ["
+            $ defTargets (d+1) targets $ "];" $ rest
+        where
+        defTargets d [] rest = rest
+        defTargets d ((Nothing, slot):xs) rest
+            = defBr d $ "*" $ defString d slot $ defTargets d xs $ rest
+        defTargets d ((Just (pr, name), slot):xs) rest
+            = defBr d $ "*" $ defString d slot $ " --[[ " $ unpackSt name
+                $ " " $ shows pr $ " ]]" $ defTargets d xs $ rest
     defString d (IAInvoke expr) rest
-        = "invoke " $ defString d expr $ ";" $ rest
+        = "invoke {" $ defString d expr $ "};" $ rest
     defString d (IASequence sa sb) rest
         = defString d sa $ defBr d $ defString d sb $ rest
-    defString d (IADropBefore locals x) rest
-        = "drop [" $ defIraLocals d locals $ "];" $ defBr d
+    defString d (IADropBefore slots x) rest
+        = "drop [" $ defList ", " d slots $ "];" $ defBr d
             $ defString d x $ rest
-    defString d (IADropAfter x locals) rest
-        = "(dropafter " $ defString d x $ " ["
-            $ defIraLocals d locals $ "])" $ rest
-    defString d (IATailCall func args locals) rest
-        = "(tailcall " $ defString d func $ " " $ defString d args $ " ["
-            $ defIraLocals d locals $ "])" $ rest
-    defString d (IATailCallMethod func index args locals) rest
-        = "(tailcallmethod " $ defString d func $ " " $ defString d index $ " "
-            $ defString d args $ " [" $ defIraLocals d locals $ "])" $ rest
+    defString d (IADropAfter x slots) rest
+        = "dropafter {" $ defString d x $ "} ["
+            $ defList ", " d slots $ "]" $ rest
+    defString d (IATailCall func args slots) rest
+        = "tailcall " $ defString d func $ " {" $ defString d args $ "} ["
+            $ defList ", " d slots $ "]" $ rest
+    defString d (IATailCallMethod func index args slots) rest
+        = "tailcallmethod " $ defString d func $ " " $ defString d index $ " {"
+            $ defString d args $ "} [" $ defList ", " d slots $ "]" $ rest
     defString d (IABranch cond ba bb) rest
         = "if " $ defString d cond $ ":"
             $ defBr (d+1) $ defString (d+1) ba
@@ -1964,25 +1984,32 @@ instance DefString (IrAction a) where
             $ defBr (d+1) $ defString (d+1) bb $ rest
     defString d (IABlock id) rest
         = "block _" $ shows id $ rest
-    defString d (IAFunction mlocation upvalues params body) rest
-        = "(function" $ defLocation d mlocation
+    defString d (IAFunction mlocation upvalues upconsts params body) rest
+        = "(" $ defBr (d+1) $ "function" $ defLocation d mlocation
             $ defUpvalues (d+1) upvalues
+            $ defUpconsts(d+1) upconsts
             $ defParameters (d+1) params
-            $ defBr (d+1) $ defString (d+1) body $ ")" $ rest
+            $ defBr (d+1) $ defString (d+1) body
+            $ defBr (d+1) $ ")" $ rest
         where
         defLocation d Nothing rest = rest
         defLocation d (Just (pr, name)) rest
             = " -- " $ unpackSt name $ " " $ shows pr $ rest
         defUpvalues d [] rest = rest
         defUpvalues d ((id, Left oid, mloc):xs) rest
-            = defBr d $ "$" $ shows id $ " <- $" $ shows oid
-                $ defLocation d mloc $ rest
-        defUpvalues d ((id, Right oid, mloc):xs) rest
-            = defBr d $ "$" $ shows id $ " <- @" $ shows oid
-                $ defLocation d mloc $ rest
+            = defBr d $ "*$" $ shows id $ " <- $" $ shows oid
+                $ defLocation d mloc $ defUpvalues d xs $ rest
+        defUpvalues d ((id, Right lid, mloc):xs) rest
+            = defBr d $ "*$" $ shows id $ " <- @" $ shows lid
+                $ defLocation d mloc $ defUpvalues d xs $ rest
+        defUpconsts d [] rest = rest
+        defUpconsts d ((id, slot, mloc):xs) rest
+            = defBr d $ "*%" $ shows id $ " <- " $ defString d slot
+                $ defLocation d mloc $ defUpconsts d xs $ rest
         defParameters d [] rest = rest
         defParameters d ((id, mloc):xs) rest
-            = defBr d $ "@" $ shows id $ defLocation d mloc $ rest
+            = defBr d $ "*@" $ shows id
+                $ defLocation d mloc $ defParameters d xs $ rest
     defString d (IAMark pr next) rest
         = "mark " $ shows pr $ ";" $ defBr d $ defString d next $ rest
 
@@ -1994,98 +2021,114 @@ instance Show CompileError where
     show (CompileError range msg) = show range ++ "\n" ++ msg
 
 
-type BlockTable = [(Int, Maybe BSt.ByteString, [Int])]
+type BlockTable = [(Int, Maybe BSt.ByteString, [IrSlot])]
 
 
 data LexicalContext = LexicalContext {
     lecxOuter :: (Maybe LexicalContext),
-    lecxNextLocalId :: Int,
-    lecxLocals :: [(BSt.ByteString, SourceRange, Int, Bool)],
+    lecxNextSlotId :: Int,
+    lecxSlots :: [(BSt.ByteString, SourceRange, IrSlot)],
     lecxUpvalues :: [(BSt.ByteString, SourceRange, Int, Either Int Int)],
+    lecxUpconsts :: [(BSt.ByteString, SourceRange, Int, IrSlot)],
     lecxVararg :: Bool,
     lecxBlocks :: BlockTable}
 
 
-lecxGetLocals
+lecxGetSlots
     :: (Monad m)
-    => StateT LexicalContext m [(BSt.ByteString, SourceRange, Int, Bool)]
-lecxGetLocals = do
-    (LexicalContext mouter lid locals upvalues va blocks) <- get
-    return $ locals
+    => StateT LexicalContext m [(BSt.ByteString, SourceRange, IrSlot)]
+lecxGetSlots = do
+    (LexicalContext mouter lid slots upvalues upconsts va blocks) <- get
+    return $ slots
 
 
-lecxSetLocals
+lecxSetSlots
     :: (Monad m)
-    => [(BSt.ByteString, SourceRange, Int, Bool)]
+    => [(BSt.ByteString, SourceRange, IrSlot)]
     -> StateT LexicalContext m ()
-lecxSetLocals locals = do
-    (LexicalContext mouter lid _ upvalues va blocks) <- get
-    put $ LexicalContext
-        mouter lid locals upvalues va blocks
+lecxSetSlots slots = do
+    (LexicalContext mouter lid _ upvalues upconsts va blocks) <- get
+    put $ LexicalContext mouter lid slots upvalues upconsts va blocks
 
 
-lecxCreateLocal
+lecxCreateSlot
     :: (Monad m)
     => BSt.ByteString
     -> SourceRange
-    -> Bool
+    -> (Int -> IrSlot)
     -> StateT LexicalContext m Int
-lecxCreateLocal name pr closing = do
-    (LexicalContext mouter lid locals upvalues va blocks) <- get
-    let entry = (name, pr, lid, closing)
+lecxCreateSlot name pr genf = do
+    (LexicalContext mouter lid slots upvalues upconsts va blocks) <- get
+    let slot = genf lid
+    let entry = (name, pr, slot)
     put $ LexicalContext
-        mouter (lid+1) (entry:locals) upvalues va blocks
+        mouter (lid+1) (entry:slots) upvalues upconsts va blocks
     return $ lid
 
 
 lecxAccessVariable
     :: BSt.ByteString
-    -> StateT LexicalContext Maybe (SourceRange, Either Int Int)
+    -> StateT LexicalContext Maybe (SourceRange, Either Int IrSlot)
 lecxAccessVariable name = do
-    lecx@(LexicalContext mouter lid locals upvalues va blocks) <- get
+    lecx@(LexicalContext mouter lid slots upvalues upconsts va blocks) <- get
     msum [
-        searchLocals locals,
+        searchSlots slots,
         searchUpvalues upvalues,
+        searchUpconsts upconsts,
         do
-            ((pr, outerid), outer') <- lift (do
+            ((pr, outersource), outer') <- lift (do
                 outer <- mouter
                 runStateT (lecxAccessVariable name) outer)
-            let id = case upvalues of
-                    (_, _, last, _):_ -> last+1
-                    [] -> 0
-            let entry = (name, pr, id, outerid)
-            put $ LexicalContext
-                (Just outer') lid locals (entry:upvalues) va blocks
-            return $ (pr, Left id)]
+            let pullUpvalue outerid = (do
+                let entry = (name, pr, lid, outerid)
+                put $ LexicalContext
+                    (Just outer') (lid+1) slots
+                    (entry:upvalues) upconsts va blocks
+                return $ (pr, Left lid))
+            let pullUpconst outerslot = (do
+                let entry = (name, pr, lid, outerslot)
+                put $ LexicalContext
+                    (Just outer') (lid+1) slots
+                    upvalues (entry:upconsts) va blocks
+                return $ (pr, Left lid))
+            case outersource of
+                Left uid -> pullUpvalue (Left uid)
+                Right (ISLocal lid) -> pullUpvalue (Right lid)
+                Right slot -> pullUpconst slot]
     where
-    searchLocals ((defname, pr, id, _):rest) = do
+    searchSlots [] = do
+        lift $ Nothing
+    searchSlots ((defname, pr, slot):rest) = do
         if defname == name
-            then return $ (pr, Right id)
-            else searchLocals rest
-    searchLocals [] = do
-        lift Nothing
+            then return $ (pr, Right slot)
+            else searchSlots rest
+    searchUpvalues [] = do
+        lift $ Nothing
     searchUpvalues ((defname, pr, id, _):rest) = do
         if defname == name
             then return $ (pr, Left id)
             else searchUpvalues rest
-    searchUpvalues [] = do
-        lift Nothing
+    searchUpconsts [] = do
+        lift $ Nothing
+    searchUpconsts ((defname, pr, id, _):rest) = do
+        if defname == name
+            then return $ (pr, Right (ISConst id))
+            else searchUpconsts rest
 
 
 lecxCreateBlock
     :: Maybe BSt.ByteString
     -> StateT LexicalContext Maybe Int
 lecxCreateBlock mname = do
-    (LexicalContext mouter lid locals upvalues va blocks) <- get
+    (LexicalContext mouter lid slots upvalues upconsts va blocks) <- get
     case mname of
         Just name -> lift $ checkDup name blocks
         Nothing -> return ()
     let id = case blocks of
             (last, _, _):_ -> last+1
-            [] -> 0
-    let locstack = reverse $ map (\(_,_,id,_) -> id) locals
+    let locstack = reverse $ map (\(_,_,id) -> id) slots
     put $ LexicalContext
-        mouter lid locals upvalues va ((id, mname, locstack):blocks)
+        mouter lid slots upvalues upconsts va ((id, mname, locstack):blocks)
     return $ id
     where
     checkDup name [] = Just ()
@@ -2104,69 +2147,107 @@ lecxNewBlock = do
 
 
 lecxGetLocalStack
-    :: (Monad m) => StateT LexicalContext m [(Int, Bool)]
+    :: (Monad m) => StateT LexicalContext m [IrSlot]
 lecxGetLocalStack = do
-    (LexicalContext mouter lid locals upvalues va blocks) <- get
-    return $ map (\(_,_,id,close) -> (id, close)) locals
+    (LexicalContext mouter lid slots upvalues upconsts va blocks) <- get
+    return $ map (\(_,_,slot) -> slot) slots
+
+
+type Compile t = StateT LexicalContext (Either CompileError) t
 
 
 compileVariable
-    :: (Int -> IrAction a)
-    -> (Int -> IrAction a)
-    -> (IrAction * -> IrAction * -> IrAction a)
+    :: (IrSlot -> Compile (IrAction a))
+    -> (Int -> Compile (IrAction a))
+    -> (IrAction * -> IrAction * -> Compile (IrAction a))
     -> NameNode
-    -> StateT LexicalContext (Either CompileError) (IrAction a)
-compileVariable onLocal onUpvalue onIndex (NameNode (pr, name)) = do
-    mapStateT (maybe err Right) $
-        tryAccess onLocal onUpvalue name `mplus` tryEnv name
+    -> Compile (IrAction a)
+compileVariable onSlot onUpvalue onIndex (NameNode (pr, name)) = do
+    driver <- mapStateT (maybe err Right) $
+        tryAccess name `mplus` tryEnv name
+    driver onSlot onUpvalue onIndex
     where
     err = Left $ CompileError pr "Cannot access a variable"
-    tryAccess onLocal onUpvalue name = do
+    tryAccess name = do
         (_, id) <- lecxAccessVariable name
-        case id of
-            Left uid -> return $ onUpvalue uid
-            Right lid -> return $ onLocal lid
+        lift $ Just $ case id of
+            Left uid -> (\onSlot onUpvalue onIndex -> onUpvalue uid)
+            Right slot -> (\onSlot onUpvalue onIndex -> onSlot slot)
     tryEnv name = do
-        onIndex
-            <$> tryAccess IALocal IAUpvalue "_ENV"
-            <*> (return $ IAString name)
+        (_, id) <- lecxAccessVariable "_ENV"
+        lift $ Just $ case id of
+            Left uid -> (\onSlot onUpvalue onIndex ->
+                onIndex (IAUpvalue uid) (IAString name))
+            Right slot -> (\onSlot onUpvalue onIndex ->
+                onIndex (IASlot slot) (IAString name))
 
 
 compileExpressionRead
-    :: ExprNode
+    :: ShowS
+    -> ExprNode
     -> StateT LexicalContext (Either CompileError) (IrAction *)
-compileExpressionRead (ExprNode (pr, ExprNil)) = do
+compileExpressionRead target (ExprNode (pr, ExprNil)) = do
     return $ IANil
-compileExpressionRead (ExprNode (pr, ExprBool b)) = do
+compileExpressionRead target (ExprNode (pr, ExprBool b)) = do
     return $ IABool b
-compileExpressionRead (ExprNode (pr, ExprInt i)) = do
+compileExpressionRead target (ExprNode (pr, ExprInt i)) = do
     return $ IAInteger i
-compileExpressionRead (ExprNode (pr, ExprReal r)) = do
+compileExpressionRead target (ExprNode (pr, ExprReal r)) = do
     return $ IARational r
-compileExpressionRead (ExprNode (pr, ExprString s)) = do
+compileExpressionRead target (ExprNode (pr, ExprString s)) = do
     return $ IAString s
-compileExpressionRead (ExprNode (pr, ExprFunction params mvararg body)) = do
-    return $ IANil -- TODO
-compileExpressionRead (ExprNode (pr, ExprTable items mlast)) = do
-    return $ IANil -- TODO
-compileExpressionRead (ExprNode (pr, ExprVar namenode)) = do
-    compileVariable IALocal IAUpvalue IAIndex namenode
-compileExpressionRead (ExprNode (pr, ExprIndex table index)) = do
+compileExpressionRead target value@(ExprNode (pr,
+        ExprFunction params mvararg body)) = do
+    let name = BSt.pack $ map byte $ target ""
+    functionira <- compileFunction pr name value
+    return $ functionira
+compileExpressionRead target (ExprNode (pr, ExprTable items mlast)) = do
+    let (posits, indits) = foldr
+            (\(mindex, value) (posits, indits) -> do
+                case mindex of
+                    Nothing -> (value:posits, indits)
+                    Just index -> (posits, (index, value):indits))
+            ([], [])
+            items
+    let positname n = target . "[" . shows n . "]"
+    let posittargets = map positname [1..]
+    posira <- compileExpressionList posittargets posits mlast
+    inditiras <- forM indits (\(index, value) -> do
+        let indexstr = case index of
+                ExprNode (_, ExprString str) ->
+                    if isValidIdent str
+                        then "." . unpackSt str
+                        else "[" . defString 0 index . "]"
+                _ -> "[" . defString 0 index . "]"
+        let valuetarget = target . indexstr
+        indexira <- compileExpressionRead "(index)" index
+        valueira <- compileExpressionRead valuetarget value
+        return $ (indexira, valueira))
+    return $ IATable
+        posira
+        inditiras
+compileExpressionRead target (ExprNode (pr, ExprVar namenode)) = do
+    compileVariable
+        (\slot -> return $ IASlot slot)
+        (\uid -> return $ IAUpvalue uid)
+        (\table index -> return $ IAIndex table index)
+        namenode
+compileExpressionRead target (ExprNode (pr, ExprIndex table index)) = do
     IAIndex
-        <$> compileExpressionRead table
-        <*> compileExpressionRead index
-compileExpressionRead (ExprNode (pr, ExprUnary op a)) = do
+        <$> compileExpressionRead target table
+        <*> compileExpressionRead target index
+compileExpressionRead target (ExprNode (pr, ExprUnary op a)) = do
     selectunary op
-        <$> compileExpressionRead a
+        <$> compileExpressionRead target a
     where
     selectunary UnaryNot = IALNot
     selectunary UnaryLength = IAUnaryLen
     selectunary UnaryMinus = IAUnaryUnm
     selectunary UnaryBNot = IAUnaryBNot
-compileExpressionRead (ExprNode (pr, ExprBinary op a b)) = do
+compileExpressionRead target (ExprNode (pr, ExprBinary op a b)) = do
     selectbinary op
-        <$> compileExpressionRead a
-        <*> compileExpressionRead b
+        <$> compileExpressionRead target a
+        <*> compileExpressionRead target b
     where
     selectbinary BinaryPower = IABinaryPow
     selectbinary BinaryTimes = IABinaryMul
@@ -2187,40 +2268,46 @@ compileExpressionRead (ExprNode (pr, ExprBinary op a b)) = do
     selectbinary BinaryGreaterEqual = IABinaryGe
     selectbinary BinaryNotEqual = IABinaryNeq
     selectbinary BinaryEqual = IABinaryEq
-compileExpressionRead (ExprNode (pr, ExprAnd a b)) = do
+compileExpressionRead target (ExprNode (pr, ExprAnd a b)) = do
     IALAnd
-        <$> compileExpressionRead a
-        <*> compileExpressionRead b
-compileExpressionRead (ExprNode (pr, ExprOr a b)) = do
+        <$> compileExpressionRead target a
+        <*> compileExpressionRead target b
+compileExpressionRead target (ExprNode (pr, ExprOr a b)) = do
     IALOr
-        <$> compileExpressionRead a
-        <*> compileExpressionRead b
+        <$> compileExpressionRead target a
+        <*> compileExpressionRead target b
 -- ExprEllipsis, ExprCall, ExprMethodCall
-compileExpressionRead expr = do
-    listira <- compileExpressionReadLast expr
+compileExpressionRead target expr = do
+    listira <- compileExpressionReadLast target expr
     return $ IACar listira
 
 
 compileExpressionReadLast
-    :: ExprNode
+    :: ShowS
+    -> ExprNode
     -> StateT LexicalContext (Either CompileError) (IrAction [*])
-compileExpressionReadLast (ExprNode (pr, ExprEllipsis)) = do
+compileExpressionReadLast target (ExprNode (pr, ExprEllipsis)) = do
     vararg <- lecxVararg <$> get
     if vararg
         then return $ IAEllipsis
         else lift $ Left $
             CompileError pr "Ellipsis must appear inside a vararg function"
-compileExpressionReadLast (ExprNode (pr, ExprCall func args mlast)) = do
+compileExpressionReadLast target (ExprNode (pr, ExprCall func args mlast)) = do
+    let argname n = "(argument " . shows n . " of " . defString 0 func . ")"
+    let argtargets = map argname [1..]
     IACall
-        <$> compileExpressionRead func
-        <*> compileExpressionList args mlast
-compileExpressionReadLast
+        <$> compileExpressionRead target func
+        <*> compileExpressionList argtargets args mlast
+compileExpressionReadLast target
         (ExprNode (pr, ExprMethodCall obj name args mlast)) = do
+    let argname n = "(argument " . shows n . " of " . defString 0 obj
+            . ":" . unpackSt name . ")"
+    let argtargets = map argname [1..]
     IACallMethod
-        <$> compileExpressionRead obj
+        <$> compileExpressionRead target obj
         <*> (return $ IAString name)
-        <*> compileExpressionList args mlast
-compileExpressionReadLast (ExprNode (pr, _)) = do
+        <*> compileExpressionList argtargets args mlast
+compileExpressionReadLast target (ExprNode (pr, _)) = do
     error "the parser shouldn't produce that"
 
 
@@ -2228,27 +2315,38 @@ compileExpressionWrite
     :: ExprNode
     -> StateT LexicalContext (Either CompileError) (IrAction (* -> ()))
 compileExpressionWrite (ExprNode (pr, ExprVar namenode)) = do
-    compileVariable IASetLocal IASetUpvalue IASetIndex namenode
+    compileVariable
+        (\slot -> do
+            case slot of
+                ISLocal id -> return $ IASetLocal id
+                _ -> lift $ Left $ errConst)
+        (\uid -> return $ IASetUpvalue uid)
+        (\table index -> return $ IASetIndex table index)
+        namenode
+    where
+    errConst = CompileError pr
+        ("Cannot assign to an immutable variable " $ defString 0 namenode $ "")
 compileExpressionWrite (ExprNode (pr, ExprIndex table index)) = do
     IASetIndex
-        <$> compileExpressionRead table
-        <*> compileExpressionRead index
+        <$> compileExpressionRead "(table)" table
+        <*> compileExpressionRead "(index)" index
 compileExpressionWrite (ExprNode (pr, _)) = do
     lift $ Left $ CompileError pr "A variable or table field expected"
 
 
 compileExpressionList
-    :: [ExprNode]
+    :: [ShowS]
+    -> [ExprNode]
     -> Maybe ExprNode
     -> StateT LexicalContext (Either CompileError) (IrAction [*])
-compileExpressionList [] Nothing = do
+compileExpressionList _ [] Nothing = do
     return $ IAEmpty
-compileExpressionList [] (Just last) = do
-    compileExpressionReadLast last
-compileExpressionList (x:xs) mlast = do
+compileExpressionList (t:targets) [] (Just last) = do
+    compileExpressionReadLast t last
+compileExpressionList (t:targets) (x:xs) mlast = do
     IACons
-        <$> compileExpressionRead x
-        <*> compileExpressionList xs mlast
+        <$> compileExpressionRead t x
+        <*> compileExpressionList targets xs mlast
 
 
 type Link t = ReaderT (BlockTable, Maybe Int) (Either CompileError) t
@@ -2262,7 +2360,7 @@ type BodyS
 
 pfindBlock
     :: Int
-    -> Link [Int]
+    -> Link [IrSlot]
 pfindBlock idref = do
     (blocks, _) <- ask
     search blocks
@@ -2276,7 +2374,7 @@ pfindBlock idref = do
 
 pfindBreak
     :: SourceRange
-    -> Link (Int, [Int])
+    -> Link (Int, [IrSlot])
 pfindBreak pr = do
     (_, mbreak) <- ask
     case mbreak of
@@ -2289,7 +2387,7 @@ pfindBreak pr = do
 pfindLabel
     :: SourceRange
     -> BSt.ByteString
-    -> Link (Int, [Int])
+    -> Link (Int, [IrSlot])
 pfindLabel pr nameref = do
     (blocks, _) <- ask
     search blocks
@@ -2305,22 +2403,23 @@ pfindLabel pr nameref = do
 
 pstackDiff
     :: SourceRange
-    -> [(Int, Bool)]
-    -> [Int]
-    -> Link [(Int, Bool)]
+    -> [IrSlot]
+    -> [IrSlot]
+    -> Link [IrSlot]
 pstackDiff pr from to = do
     case to of
         tid:trest -> do
             case from of
-                (fid, fclose):frest -> do
+                fid:frest -> do
                     if tid == fid
                         then pstackDiff pr frest trest
                         else err
                 [] -> err
         [] -> return $ reverse $ from
     where
-    err = lift $ Left $
-        CompileError pr "Jump lands inside a variable's scope"
+    err = do
+        lift $ Left $
+            CompileError pr "Jump lands inside a variable's scope"
 
 
 plocalBreak
@@ -2328,6 +2427,16 @@ plocalBreak
     -> Link a
     -> Link a
 plocalBreak breakid link = local (\(blocks, _) -> (blocks, Just breakid)) link
+
+
+makeDropBefore
+    :: [IrSlot]
+    -> IrAction [*]
+    -> IrAction [*]
+makeDropBefore slots (IADropBefore slots' after)
+    = IADropBefore (slots ++ slots') after
+makeDropBefore slots after
+    = IADropBefore slots after
 
 
 compileBody
@@ -2342,7 +2451,8 @@ compileBody (StatNode (pr, StatNull):others) prev = do
     compileBody others prev
 
 compileBody (StatNode (pr, StatAssign lhs rhs mlast):others) prev = do
-    sourceira <- compileExpressionList rhs mlast
+    let targets = map (defString 0) lhs ++ repeat id
+    sourceira <- compileExpressionList targets rhs mlast
     targets <- forM lhs compileExpressionWrite
     compileBody others (do
         cprev <- prev
@@ -2360,7 +2470,7 @@ compileBody (StatNode (pr, StatInvoke expr):others) prev = do
         ExprNode (_, ExprMethodCall _ _ _ _) -> return ()
         _ -> lift $ Left $
             CompileError pr "Function call expected"
-    exprira <- compileExpressionReadLast expr
+    exprira <- compileExpressionReadLast "(invoke)" expr
     compileBody others (do
         cprev <- prev
         return (\after bbs -> do
@@ -2390,7 +2500,7 @@ compileBody (StatNode (pr, StatBreak):others) prev = do
     compileBody others (do
         cprev <- prev
         (breakid, targetstack) <- pfindBreak pr
-        stackdiff <- pstackDiff pr currentstack targetstack
+        stackdiff <- pstackDiff pr (reverse currentstack) targetstack
         return (\after bbs -> do
             case stackdiff of
                 [] -> cprev
@@ -2399,8 +2509,7 @@ compileBody (StatNode (pr, StatBreak):others) prev = do
                     bbs
                 _ -> cprev
                     (IAMark pr $
-                        IADropBefore stackdiff $
-                            IABlock breakid)
+                        IADropBefore stackdiff (IABlock breakid))
                     bbs))
 
 compileBody (StatNode (pr, StatGoto label):others) prev = do
@@ -2409,7 +2518,7 @@ compileBody (StatNode (pr, StatGoto label):others) prev = do
     compileBody others (do
         cprev <- prev
         (targetid, targetstack) <- pfindLabel pr name
-        stackdiff <- pstackDiff pr currentstack targetstack
+        stackdiff <- pstackDiff pr (reverse currentstack) targetstack
         return (\after bbs -> do
             case stackdiff of
                 [] -> cprev
@@ -2418,8 +2527,7 @@ compileBody (StatNode (pr, StatGoto label):others) prev = do
                     bbs
                 _ -> cprev
                     (IAMark pr $
-                        IADropBefore stackdiff $
-                            IABlock targetid)
+                        IADropBefore stackdiff (IABlock targetid))
                     bbs))
 
 compileBody (StatNode (pr, StatDo body):others) prev = do
@@ -2429,7 +2537,7 @@ compileBody (StatNode (pr, StatDo body):others) prev = do
 compileBody (StatNode (pr, StatWhile cond body):others) prev = do
     let (ExprNode (condpr, _)) = cond
     loopid <- lecxNewBlock
-    condira <- compileExpressionRead cond
+    condira <- compileExpressionRead "(while condition)" cond
     pbody <- compileBody body (return (,))
     nextid <- lecxNewBlock
     compileBody others (do
@@ -2446,7 +2554,7 @@ compileBody (StatNode (pr, StatRepeat body cond):others) prev = do
     let (ExprNode (condpr, _)) = cond
     loopid <- lecxNewBlock
     pbody <- compileBody body (return (,))
-    condira <- compileExpressionRead cond
+    condira <- compileExpressionRead "(repeat condifion)" cond
     nextid <- lecxNewBlock
     compileBody others (do
         cprev <- prev
@@ -2460,7 +2568,7 @@ compileBody (StatNode (pr, StatRepeat body cond):others) prev = do
             cprev (IABlock loopid) (loopbb:bodybbs)))
 
 compileBody (StatNode (pr, StatIf cond tbody estat):others) prev = do
-    condira <- compileExpressionRead cond
+    condira <- compileExpressionRead "(if condition)" cond
     ptbody <- compileBody tbody (return (,))
     pestat <- compileBody [estat] (return (,))
     nextid <- lecxNewBlock
@@ -2478,79 +2586,215 @@ compileBody (StatNode (pr, StatIf cond tbody estat):others) prev = do
                 (IAMark pr branchira)
                 tbodybbs))
 
--- compileStatement (StatNode (pr, StatForNum param init final mstep body)) = do
-    -- let link after = do
-        -- return $
-            -- IAMark pr $
-                -- after
-    -- return $ link
+compileBody (StatNode (pr,
+        StatForNum param start limit mdelta body):others) prev = do
+    let (NameNode (parampr, paramname)) = param
+    startira <- compileExpressionRead "(range start)" start
+    limitira <- compileExpressionRead "(range limit)" limit
+    deltaira <- case mdelta of
+            Just delta -> compileExpressionRead "(range delta)" delta
+            Nothing -> return $ IAInteger 1
+    oldstack <- lecxGetSlots
+    fiterid <- lecxCreateSlot "(range iterator)" pr ISConst
+    paramid <- lecxCreateSlot paramname parampr ISLocal
+    loopid <- lecxNewBlock
+    pbody <- compileBody body (return (,))
+    lecxSetSlots oldstack
+    nextid <- lecxNewBlock
+    compileBody others (do
+        cprev <- prev
+        cbody <- plocalBreak nextid pbody
+        return (\after bbs -> do
+            let (bodyira, bodybbs) = cbody
+                    (IABlock loopid)
+                    ((nextid, after):bbs)
+            let exitira = IADropBefore
+                    [
+                        ISLocal paramid,
+                        ISConst fiterid]
+                    (IABlock nextid)
+            let branchira = IABranch
+                    (IASlot (ISLocal paramid))
+                    bodyira
+                    exitira
+            let stepira = IASequence
+                    (IAAssign
+                        (IACall
+                            (IASlot (ISConst fiterid))
+                            IAEmpty)
+                        [IASetLocal paramid])
+                    branchira
+            let loopira = IABlock loopid
+            let loopbbs = (loopid, IAMark parampr stepira):bodybbs
+            let initira = IASequence
+                    (IAOpen
+                        (IARange startira limitira deltaira)
+                        [
+                            (Just (pr, "(range iterator)"), ISConst fiterid),
+                            (Just (parampr, paramname), ISLocal paramid)])
+                    loopira
+            cprev
+                (IAMark pr initira)
+                loopbbs))
 
--- compileStatement (StatNode (pr, StatForEach lhs rhs mlast body)) = do
-    -- let link after = do
-        -- return $
-            -- IAMark pr $
-                -- after
-    -- return $ link
+compileBody (StatNode (pr, StatForEach lhs rhs mlast body):others) prev = do
+    let lhspr = foldl' (<>) (collapseRangeNull pr) $
+            map (\(NameNode (pr, _)) -> pr) lhs
+    initlistira <- compileExpressionList
+        ([
+            "(for iterator)",
+            "(for context)",
+            "(for index)",
+            "(for guard)"] ++ repeat id)
+        rhs mlast
+    oldstack <- lecxGetSlots
+    fiterid <- lecxCreateSlot "(for iterator)" pr ISConst
+    fstateid <- lecxCreateSlot "(for context)" pr ISConst
+    findexid <- lecxCreateSlot "(for index)" pr ISLocal
+    fguardid <- lecxCreateSlot "(for guard)" pr ISGuard
+    locals <- forM lhs (\(NameNode (pr, name)) -> do
+        lid <- lecxCreateSlot name pr ISLocal
+        return $ (Just (pr, name), lid))
+    let (_, firstlocalid):_ = locals
+    loopid <- lecxNewBlock
+    pbody <- compileBody body (return (,))
+    lecxSetSlots oldstack
+    nextid <- lecxNewBlock
+    compileBody others (do
+        cprev <- prev
+        cbody <- plocalBreak nextid pbody
+        return (\after bbs -> do
+            let (bodyira, bodybbs) = cbody
+                    (IABlock loopid)
+                    ((nextid, after):bbs)
+            let droplist = reverse $ (map (ISLocal . snd) locals)
+            let exitira = IADropBefore
+                    (droplist ++ [
+                        ISGuard fguardid,
+                        ISLocal findexid,
+                        ISConst fstateid,
+                        ISConst fiterid])
+                    (IABlock nextid)
+            let branchira = IABranch
+                    (IASlot (ISLocal findexid))
+                    bodyira
+                    exitira
+            let stepira = IASequence
+                    (IAAssign
+                        (IACall
+                            (IASlot (ISConst fiterid))
+                            (IACons
+                                (IASlot (ISConst fstateid))
+                                (IACons
+                                    (IASlot (ISLocal findexid))
+                                    IAEmpty)))
+                        (map (IASetLocal . snd) locals))
+                    (IASequence
+                        (IAAssign
+                            (IACons (IASlot (ISLocal firstlocalid)) IAEmpty)
+                            [IASetLocal findexid])
+                        branchira)
+            let loopira = IABlock loopid
+            let loopbbs = (loopid, IAMark lhspr stepira):bodybbs
+            let initira = IASequence
+                    (IAOpen
+                        initlistira
+                        [
+                            (Just (pr, "(for iterator)"), ISConst fiterid),
+                            (Just (pr, "(for context)"), ISConst fstateid),
+                            (Just (pr, "(for index)"), ISLocal findexid),
+                            (Just (pr, "(for guard)"), ISGuard fguardid)])
+                    (IASequence
+                        (IAOpen
+                            IAEmpty
+                            (map (\(def, lid) -> (def, ISLocal lid)) locals))
+                        loopira)
+            cprev
+                (IAMark pr initira)
+                loopbbs))
 
--- compileStatement (StatNode (pr, StatFunction target value)) = do
-    -- let link after = do
-        -- return $
-            -- IAMark pr $
-                -- after
-    -- return $ link
+compileBody (StatNode (pr, StatFunction target value):others) prev = do
+    let name = BSt.pack $ map byte $ defString 0 target ""
+    functionira <- compileFunction pr name value
+    targetira <- compileExpressionWrite target
+    compileBody others (do
+        cprev <- prev
+        return (\after bbs -> do
+            let assignira = IAAssign
+                    (IACons functionira IAEmpty)
+                    [targetira]
+            cprev
+                (IAMark pr (IASequence assignira after))
+                bbs))
 
--- compileStatement (StatNode (pr, StatLocalFunction name value scope)) = do
-    -- let link after = do
-        -- return $
-            -- IAMark pr $
-                -- after
-    -- return $ link
-
-compileBody (StatNode (pr, StatLocalDef lhs rhs mlast scope):others) prev = do
-    msources <- case (rhs, mlast) of
-        ([], Nothing) -> return $ Nothing
-        _ -> Just <$> compileExpressionList rhs mlast
-    oldscope <- lecxGetLocals
-    locals <- forM lhs makeLocal
+compileBody (StatNode (pr,
+        StatLocalFunction namenode value scope):others) prev = do
+    let (NameNode (namepr, name)) = namenode
+    oldscope <- lecxGetSlots
+    lid <- lecxCreateSlot name namepr ISLocal
+    functionira <- compileFunction pr name value
     pscope <- compileBody scope (return (,))
-    lecxSetLocals oldscope
+    lecxSetSlots oldscope
     compileBody others (do
         cprev <- prev
         cscope <- pscope
         return (\after bbs -> do
-            let droplist = reverse $
-                    map (\(id, close, _, _) -> (id, close)) locals
-            let dropira = IADropBefore droplist after
+            let dropira = makeDropBefore [ISLocal lid] after
             let (scopeira, scopebbs) = cscope dropira bbs
-            let initira = case msources of
-                    Just sources -> do
-                        let targets = map (\(_, _, _, set) -> set) locals
-                        IASequence (IAAssign sources targets) scopeira
-                    Nothing -> scopeira
-            let openira = foldr
-                    (\(_, _, open, _) r -> IASequence open r)
+            let initira = IASequence
+                    (IAAssign
+                        (IACons functionira IAEmpty)
+                        [IASetLocal lid])
+                    scopeira
+            let openira = IASequence
+                    (IAOpen
+                        IAEmpty
+                        [(Just (namepr, name), ISLocal lid)])
                     initira
-                    locals
             cprev
                 (IAMark pr openira)
                 scopebbs))
 
+compileBody (StatNode (pr, StatLocalDef lhs rhs mlast scope):others) prev = do
+    let targets = map (\(name, _) -> defString 0 name) lhs ++ repeat id
+    sourcesira <- compileExpressionList targets rhs mlast
+    oldscope <- lecxGetSlots
+    locals <- forM lhs makeLocal
+    pscope <- compileBody scope (return (,))
+    lecxSetSlots oldscope
+    compileBody others (do
+        cprev <- prev
+        cscope <- pscope
+        return (\after bbs -> do
+            let droplist = reverse $ map snd locals
+            let dropira = makeDropBefore droplist after
+            let (scopeira, scopebbs) = cscope dropira bbs
+            let initira = IASequence
+                    (IAOpen
+                        sourcesira
+                        locals)
+                    scopeira
+            cprev
+                (IAMark pr initira)
+                scopebbs))
+
     where
     makeLocal (NameNode (pr, name), mattr) = do
-        close <- case mattr of
-            Nothing -> return $ False
-            Just "close" ->  return $ True
+        genf <- case mattr of
+            Nothing -> return $ ISLocal
+            Just "const" ->  return $ ISConst
+            Just "close" ->  return $ ISGuard
             _ -> lift $ Left $ CompileError pr "Invalid variable attribute"
-        id <- lecxCreateLocal name pr close
-        let openira = IANewLocal (Just (pr, name)) id close
-        let setira = IASetLocal id
-        return $ (id, close, openira, setira)
+        lid <- lecxCreateSlot name pr genf
+        return $ (Just (pr, name), genf lid)
 
 compileBody (StatNode (pr,
         StatReturn [] (Just (ExprNode (_,
             ExprCall func args mlast)))):others) prev = do
-    funcira <- compileExpressionRead func
-    argira <- compileExpressionList args mlast
+    let argname n = "(argument " . shows n . " of " . defString 0 func . ")"
+    let argtargets = map argname [1..]
+    funcira <- compileExpressionRead "(return)" func
+    argira <- compileExpressionList argtargets args mlast
     currentstack <- lecxGetLocalStack
     compileBody others (do
         cprev <- prev
@@ -2563,9 +2807,12 @@ compileBody (StatNode (pr,
 compileBody (StatNode (pr,
         StatReturn [] (Just (ExprNode (_,
             ExprMethodCall obj name args mlast)))):others) prev = do
-    objira <- compileExpressionRead obj
+    let argname n = "(argument " . shows n . " of " . defString 0 obj
+            . ":" . unpackSt name . ")"
+    let argtargets = map argname [1..]
+    objira <- compileExpressionRead "(return)" obj
     let nameira = IAString name
-    argira <- compileExpressionList args mlast
+    argira <- compileExpressionList argtargets args mlast
     currentstack <- lecxGetLocalStack
     compileBody others (do
         cprev <- prev
@@ -2576,7 +2823,8 @@ compileBody (StatNode (pr,
                 bbs))
 
 compileBody (StatNode (pr, StatReturn rhs mlast):others) prev = do
-    valueira <- compileExpressionList rhs mlast
+    let targets = map (\n -> "(return " . shows n . ")") [1..]
+    valueira <- compileExpressionList targets rhs mlast
     currentstack <- lecxGetLocalStack
     compileBody others (do
         cprev <- prev
@@ -2587,42 +2835,84 @@ compileBody (StatNode (pr, StatReturn rhs mlast):others) prev = do
                 bbs))
 
 
-compileBody (StatNode (pr, _):others) prev = do
-    compileBody others (do
-        cprev <- prev
-        return (\after bbs -> do
-            cprev
-                (IAMark pr after)
-                bbs))
+compileFunction
+    :: SourceRange
+    -> BSt.ByteString
+    -> ExprNode
+    -> StateT LexicalContext (Either CompileError) (IrAction *)
+compileFunction pr name (ExprNode (_,
+        ExprFunction paramnodes mvarargnode stats)) = do
+    let isvararg = isJust mvarargnode
+    outer <- get
+    let (paramdefs, paramdecls, paramslots, paramcount) = foldr
+            (\(NameNode (pr, name)) (defs, decls, slots, count) ->
+                (
+                    (name, pr, ISLocal count):defs,
+                    (count, Just (pr, name)):decls,
+                    (ISLocal count):slots,
+                    count+1))
+            ([], [], [], 0)
+            (reverse paramnodes)
+    let innerContext = LexicalContext {
+        lecxOuter = Just outer,
+        lecxNextSlotId = paramcount,
+        lecxSlots = paramdefs,
+        lecxUpvalues = [],
+        lecxUpconsts = [],
+        lecxVararg = isvararg,
+        lecxBlocks = [(0, Nothing, [])]}
+    (pbody, context) <- lift $
+        runStateT (compileBody stats (return (,))) innerContext
+    put $ fromJust $ lecxOuter context
+    cbody <- lift $ runReaderT pbody ((lecxBlocks context), Nothing)
+    let (main, bbs) = cbody (finalize paramslots) []
+    let upvaluedecls = reverse $ map
+            (\(name, pr, id, source) -> (id, source, Just (pr, name)))
+            (lecxUpvalues context)
+    let upconstdecls = reverse $ map
+            (\(name, pr, id, source) -> (id, source, Just (pr, name)))
+            (lecxUpconsts context)
+    return $ IAFunction
+        (Just (pr, name))
+        upvaluedecls
+        upconstdecls
+        (reverse paramdecls)
+        ((0, main):bbs)
+    where
+    openParams [] = ([], 0)
+    openParams ((pr, name):xs) = do
+        let (rest, rcount) = openParams xs
+        ((name, pr, rcount, False):rest, rcount+1)
+    finalize [] = IAEmpty
+    finalize paramslots = IADropBefore paramslots IAEmpty
 
 
--- compileFunctionBody
-    -- :: [StatNode]
-    -- -> StateT LexicalContext (Either CompileError) IrBody
--- compileFunctionBody body = do
-    -- outer <- get
-    -- let innerContext = LexicalContext {
-        -- lecxOuter = Just outer,
-        -- lecxNextLocalId = 0,
-        -- lecxLocals = [],
-        -- lecxUpvalues = [],
-        -- lecxVararg :: Bool,
-        -- lecxBlocks :: BlockTable}
-
-
-compileChunk :: FilePath -> [StatNode] -> Either CompileError IrBody
+compileChunk :: FilePath -> [StatNode] -> Either CompileError (IrAction *)
 compileChunk filename stats = do
     let baseContext = LexicalContext {
         lecxOuter = Nothing,
-        lecxNextLocalId = 0,
-        lecxLocals = [],
+        lecxNextSlotId = 1,
+        lecxSlots = [],
         lecxUpvalues = [("_ENV", nullRange filename, 0, Right 0)],
+        lecxUpconsts = [],
         lecxVararg = True,
         lecxBlocks = [(0, Nothing, [])]}
     (pbody, context) <- runStateT (compileBody stats (return (,))) baseContext
     cbody <- runReaderT pbody ((lecxBlocks context), Nothing)
     let (main, bbs) = cbody IAEmpty []
-    return $ (0, main):bbs
+    let chunk = IAFunction
+            Nothing
+            [(0, Right 0, Just (nullRange filename, "_ENV"))]
+            []
+            []
+            ((0, main):bbs)
+    let outerFunction = IAFunction
+            Nothing
+            []
+            []
+            [(0, Just (nullRange filename, "_ENV"))]
+            [(0, IACons chunk IAEmpty)]
+    return $ outerFunction
 
 
 test :: IO ()
@@ -2638,4 +2928,4 @@ test = do
                 Left err -> putStrLn $ show err
                 Right irbody -> do
                     let str = defString 0 irbody ""
-                    putStrLn $ str
+                    writeFile "..\\testir.lua" str
