@@ -27,10 +27,11 @@ import Data.Maybe
 import Data.String
 import Data.STRef
 import Type.Reflection
-import SourceRange (SourceRange)
+import SourceRange
 import qualified Data.Array as A
 import qualified Data.Array.ST as V
 import qualified Data.ByteString as BSt
+import qualified Data.ByteString.Lazy as B
 import qualified Data.Map.Strict as M
 import qualified Data.Ratio as R
 import qualified Coroutine as Y
@@ -230,6 +231,17 @@ data LuaKey q s
     deriving (Show, Ord, Eq)
 
 
+errArgType
+    :: Int
+    -> BSt.ByteString
+    -> LuaValue q s
+    -> LuaValue q s
+errArgType n expected value = LString $ BSt.concat [
+        "Expected a ", expected, " at argument ",
+        BSt.pack (map (toEnum . fromEnum) (show n)),
+        ", got a ", lvalTypename value]
+
+
 errDivideZero :: LuaValue q s
 errDivideZero = LString $ "Attempt to divide by zero"
 
@@ -255,7 +267,7 @@ errWrongBit = LString $
 
 errWrongCall :: BSt.ByteString -> LuaValue q s
 errWrongCall typename = LString $ BSt.concat [
-    "Attempt to call a ", typename, "number"]
+    "Attempt to call a ", typename]
 
 errWrongCompare :: BSt.ByteString -> BSt.ByteString -> LuaValue q s
 errWrongCompare tn1 tn2
@@ -1143,7 +1155,7 @@ luaArithSub a b = lxPerformBinary
     a b
 
 luaArithMul a b = lxPerformBinary
-    (lxRawArithNum (-))
+    (lxRawArithNum (*))
     lmtMul
     (lxError $ errWrongArith2 (lvalTypename a) (lvalTypename b))
     a b
@@ -1325,7 +1337,7 @@ luaGet a b = do
                     case result of
                         Just ret -> return $ ret
                         Nothing -> metaGet $ return LNil
-        _ -> metaGet $ lxError $ errWrongTable (lvalTypename b)
+        _ -> metaGet $ lxError $ errWrongTable (lvalTypename a)
     where
     metaGet def = do
         lxMetatable a (\x mt ->
@@ -1680,26 +1692,6 @@ luaYield
 luaYield = lxYield
 
 
-lualibCore :: LuaState q s (LuaValue q s)
-lualibCore = do
-    elems <- mapM makef [
-        ("write", (\args -> do
-            luaLiftIO $
-                forM_ args (\arg -> do
-                    case arg of
-                        LString str -> BSt.putStr str
-                        _ -> putStr $ show arg)
-            return $ []))]
-    luaCreateTable elems
-    where
-    makef
-        :: (BSt.ByteString, LuaFunction q s)
-        -> LuaState q s (LuaValue q s, LuaValue q s)
-    makef (name, func) = do
-        fv <- luaCreateFunction func
-        return $ (luaPush name, fv)
-
-
 data LirContext q s = LirContext {
     lirxBody :: IrBody,
     lirxVararg :: [LuaValue q s],
@@ -1825,50 +1817,11 @@ lirValue (IAFunction
                 Right (ISGuard id) -> do
                     lift $ lxLiftST $ V.readArray (lirxGuards ctx) id
         return $ (mdef, value))
-    let upvalueArray = A.listArray
-            (0, length upvalues - 1)
-            (map snd upvalues)
-    let upconstArray = A.listArray
-            (0, length upconsts - 1)
-            (map snd upconsts)
-    let upvalueList =
-            map (\(mdef, ref) -> (mdef, Right ref)) upvalues
-            ++ map (\(mdef, value) -> (mdef, Left value)) upconsts
-    let function args = (do
-        locals <- replicateM maxl $ lxAlloc LNil
-        let localArray = A.listArray
-                (0, maxl - 1)
-                locals
-        constArray <- lxLiftST $ V.newArray (0, maxc - 1) LNil
-        guardArray <- lxLiftST $ V.newArray (0, maxg - 1) LNil
-        (vararg, argvarlist, stack) <- parseArgs localArray paramdefs args
-        locationRef <- lxAlloc Nothing
-        let lirContext = LirContext {
-            lirxBody = funcbody,
-            lirxVararg = vararg,
-            lirxUpvalues = upvalueArray,
-            lirxUpconsts = upconstArray,
-            lirxLocals = localArray,
-            lirxConsts = constArray,
-            lirxGuards = guardArray,
-            lirxStack = stack,
-            lirxLocation = locationRef}
-        let lstackFrame = LuaStackFrame {
-            lsfDefinition = mlocation,
-            lsfCurrentLocation = locationRef,
-            lsfUpvalues = upvalueList,
-            lsfLocals = argvarlist}
-        local (lctxModifyStack (lstackFrame:)) $ lirExecute lirContext)
-    lift $ luaCreateFunction function
-    where
-    parseArgs localArray [] args = do
-        return $ (args, [], [])
-    parseArgs localArray ((id, mdef):ps) args = do
-        let (arg, as) = fromMaybe (LNil, []) (uncons args)
-        let ref = localArray A.! id
-        lxWrite ref arg
-        (vararg, argvarlist, stack) <- parseArgs localArray ps as
-        return $ (vararg, (mdef, Right ref):argvarlist, (ISLocal id):stack)
+    lift $
+        luaCreateFunction $
+            lirFunction
+                mlocation upvalues upconsts paramdefs
+                maxl maxc maxg funcbody
 
 
 lirValueUnary
@@ -2063,16 +2016,141 @@ lirInvalid :: LirState q s a
 lirInvalid = lift $ lxError $ LString "Invalid IR"
 
 
-testfunc :: LuaState q s String
+lirFunction
+    :: Maybe (SourceRange, BSt.ByteString)
+    -> [(Maybe (SourceRange, BSt.ByteString), STRef s (LuaValue q s))]
+    -> [(Maybe (SourceRange, BSt.ByteString), LuaValue q s)]
+    -> [(Int, Maybe (SourceRange, BSt.ByteString))]
+    -> Int -> Int -> Int
+    -> IrBody
+    -> LuaFunction q s
+lirFunction mlocation upvalues upconsts paramdefs maxl maxc maxg funcbody = do
+    let upvalueArray = A.listArray
+            (0, length upvalues - 1)
+            (map snd upvalues)
+    let upconstArray = A.listArray
+            (0, length upconsts - 1)
+            (map snd upconsts)
+    let upvalueList =
+            map (\(mdef, ref) -> (mdef, Right ref)) upvalues
+            ++ map (\(mdef, value) -> (mdef, Left value)) upconsts
+    let function args = (do
+        locals <- replicateM maxl $ lxAlloc LNil
+        let localArray = A.listArray
+                (0, maxl - 1)
+                locals
+        constArray <- lxLiftST $ V.newArray (0, maxc - 1) LNil
+        guardArray <- lxLiftST $ V.newArray (0, maxg - 1) LNil
+        (vararg, argvarlist, stack) <- parseArgs localArray paramdefs args
+        locationRef <- lxAlloc Nothing
+        let lirContext = LirContext {
+            lirxBody = funcbody,
+            lirxVararg = vararg,
+            lirxUpvalues = upvalueArray,
+            lirxUpconsts = upconstArray,
+            lirxLocals = localArray,
+            lirxConsts = constArray,
+            lirxGuards = guardArray,
+            lirxStack = stack,
+            lirxLocation = locationRef}
+        let lstackFrame = LuaStackFrame {
+            lsfDefinition = mlocation,
+            lsfCurrentLocation = locationRef,
+            lsfUpvalues = upvalueList,
+            lsfLocals = argvarlist}
+        local (lctxModifyStack (lstackFrame:)) $ lirExecute lirContext)
+    function
+    where
+    parseArgs localArray [] args = do
+        return $ (args, [], [])
+    parseArgs localArray ((id, mdef):ps) args = do
+        let (arg, as) = fromMaybe (LNil, []) (uncons args)
+        let ref = localArray A.! id
+        lxWrite ref arg
+        (vararg, argvarlist, stack) <- parseArgs localArray ps as
+        return $ (vararg, (mdef, Right ref):argvarlist, (ISLocal id):stack)
+
+
+luaLoad
+    :: FilePath
+    -> B.ByteString
+    -> LuaValue q s
+    -> LuaState q s (LuaValue q s)
+luaLoad filename source fenv = do
+    case translateLua filename source of
+        Left err -> luaError $ luaPush err
+        Right (maxl, maxc, maxg, funcbody) -> do
+            envref <- lxAlloc $ fenv
+            let mlocation = Just (nullRange filename, "(chunk)")
+            let upvalues = [(Just (nullRange filename, "_ENV"), envref)]
+            let upconsts = []
+            let paramdefs = []
+            luaCreateFunction $
+                lirFunction
+                    mlocation upvalues upconsts paramdefs
+                    maxl maxc maxg funcbody
+
+
+lualibCore :: LuaState q s (LuaValue q s)
+lualibCore = do
+    io <- luaCreateTable =<< mapM makef [
+        ("write", (\args -> do
+            luaLiftIO $
+                forM_ args (\arg -> do
+                    case arg of
+                        LString str -> BSt.putStr str
+                        _ -> putStr $ show arg)
+            return $ []))]
+    math <- luaCreateTable =<< mapM makef [
+        ("abs", (\args -> do
+            let a:_ = lxExtend 1 args
+            case a of
+                LInteger x -> return $ [LInteger $ abs x]
+                LRational x -> return $ [LRational $ abs x]
+                LDouble x -> return $ [LDouble $ abs x]
+                _ -> luaError $ errArgType 1 "number" a)),
+        ("exact", (\args -> do
+            let a:_ = lxExtend 1 args
+            case a of
+                LInteger x -> return $ [a]
+                LRational x -> return $ [a]
+                LDouble x -> if isNaN x || isInfinite x
+                    then return $ [a]
+                    else do
+                        let rat = toRational x
+                        if R.denominator rat == 1
+                            then return $ [LInteger $ R.numerator rat]
+                            else return $ [LRational $ rat]
+                _ -> luaError $ errArgType 1 "number" a)),
+        ("inexact", (\args -> do
+            let a:_ = lxExtend 1 args
+            case a of
+                LInteger x -> return $ [LDouble $ fromInteger x]
+                LRational x -> return $ [LDouble $ fromRational x]
+                LDouble x -> return $ [a]
+                _ -> luaError $ errArgType 1 "number" a))]
+    elems <- mapM makef []
+    luaCreateTable (
+        (LString "io", io)
+        :(LString "math", math)
+        :elems)
+    where
+    makef
+        :: (BSt.ByteString, LuaFunction q s)
+        -> LuaState q s (LuaValue q s, LuaValue q s)
+    makef (name, func) = do
+        fv <- luaCreateFunction func
+        return $ (luaPush name, fv)
+
+
+testfunc :: LuaState q s ()
 testfunc = do
-    let lv = luaPush ("aaa" :: BSt.ByteString)
-    luaTry (do
-        luaLiftIO $ print lv
-        luaYield [])
-    let a = LInteger 10
-    let b = LString "asdf"
-    c <- luaArithAdd a b
-    return $ show c
+    let path = "..\\test.lua"
+    input <- luaLiftIO $ B.readFile path
+    env <- lualibCore
+    chunk <- luaLoad path input env
+    luaCall chunk []
+    return ()
 
 
 test' :: IO ()
@@ -2080,7 +2158,7 @@ test' = do
     let r = runST $ lxRunST $ testfunc
     case r of
         Left e -> putStrLn $ e
-        Right s -> putStrLn $ s
+        Right s -> print $ s
 
 
 test :: IO ()
@@ -2088,4 +2166,4 @@ test = do
     r <- lxRunIO $ testfunc
     case r of
         Left e -> putStrLn $ e
-        Right i -> putStrLn $ i
+        Right i -> print $ i

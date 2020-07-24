@@ -2977,7 +2977,10 @@ compileFunction pr name (ExprNode (_,
         ((0, main):bbs)
 
 
-compileChunk :: FilePath -> [StatNode] -> Either CompileError IrValue
+compileChunk
+    :: FilePath
+    -> [StatNode]
+    -> Either CompileError (Int, Int, Int, IrBody)
 compileChunk filename stats = do
     let baseContext = LexicalContext {
         lecxOuter = Nothing,
@@ -2993,28 +2996,17 @@ compileChunk filename stats = do
     (pbody, context) <- runStateT (compileBody stats (return (,))) baseContext
     cbody <- runReaderT pbody ((lecxBlocks context), Nothing)
     let (main, bbs) = cbody (IAReturn IAEmpty) []
-    let chunk = IAFunction
-            Nothing
-            [(Right 0, Just (nullRange filename, "_ENV"))]
-            []
-            []
-            (lecxMaxLocals context)
-            (lecxMaxConsts context)
-            (lecxMaxGuards context)
-            ((0, main):bbs)
-    let outerFunction = IAFunction
-            Nothing
-            []
-            []
-            [(0, Just (nullRange filename, "_ENV"))]
-            1
-            0
-            0
-            [(0, IAReturn (IACons chunk IAEmpty))]
-    return $ outerFunction
+    return $ (
+        lecxMaxLocals context,
+        lecxMaxConsts context,
+        lecxMaxGuards context,
+        (0, main):bbs)
 
 
-translateLua :: FilePath -> B.ByteString -> Either String IrValue
+translateLua
+    :: FilePath ->
+    B.ByteString ->
+    Either String (Int, Int, Int, IrBody)
 translateLua filename source = do
     parse <- errToStr $ parseGrammar gramChunk filename source
     errToStr $ compileChunk filename parse
@@ -3035,6 +3027,9 @@ test = do
             writeFile "..\\testout.lua" str
             case compileChunk path x of
                 Left err -> putStrLn $ show err
-                Right irbody -> do
-                    let str = defString 0 irbody ""
+                Right (maxl, maxc, maxg, irbody) -> do
+                    let str = shows maxl $ "@ "
+                            $ shows maxc $ "% "
+                            $ shows maxg $ "&"
+                            $ defBr 0 $ defString 0 irbody ""
                     writeFile "..\\testir.lua" str
