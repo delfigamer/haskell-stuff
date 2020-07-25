@@ -1,10 +1,11 @@
-module SourceRange (
+module Lua.SourceRange (
+    SourceName,
     SourceRange,
+    collapseRangeLeft,
+    collapseRangeNull,
+    collapseRangeRight,
     newRange,
     nullRange,
-    collapseRangeNull,
-    collapseRangeLeft,
-    collapseRangeRight,
     rangeLeft,
     rangeRight,
 ) where

@@ -1,7 +1,7 @@
 {-# LANGUAGE RankNTypes #-}
 
 
-module Coroutine (
+module Lua.Coroutine (
     CoroutineT(..),
     raise,
     yield,
