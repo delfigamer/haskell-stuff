@@ -48,6 +48,7 @@ module Lua.Common (
     luaArithShr,
     luaArithSub,
     luaArithUnm,
+    luaAsString,
     luaCall,
     luaCloseAfter,
     luaCompareLt,
@@ -77,6 +78,8 @@ module Lua.Common (
     luaRawSet,
     luaRead,
     luaResume,
+    luaRunIO,
+    luaRunST,
     luaRunT,
     luaSet,
     luaSetMetatable,
@@ -89,6 +92,7 @@ module Lua.Common (
     luaToString,
     luaToUserdata,
     luaTry,
+    luaTypename,
     luaWrite,
     luaXPCall,
     luaXTry,
@@ -193,6 +197,12 @@ luaArithShr a b = lxPerformBinary
     lmtShr
     (lxError $ errWrongArith2 a b)
     a b
+
+
+luaAsString
+    :: LuaValue q s
+    -> LuaState q s BSt.ByteString
+luaAsString a = lxAsString a
 
 
 luaCall
@@ -495,6 +505,34 @@ luaResume a args = do
         _ -> lxError $ errWrongResume a
 
 
+luaRunIO
+    :: (forall q . LuaState q RealWorld t)
+    -> IO (Either String t)
+luaRunIO = luaRunT resolveST resolveIO resolveYield onError onPure
+    where
+    resolveST act = stToIO $ act
+    resolveIO act = Just <$> act
+    resolveYield vals = return $ Left $ errWrongYield
+    onError (LString msg)
+        = return $ Left $ BSt.unpack msg
+    onError _ = return $ Left $ "Unknown error"
+    onPure x = return $ Right $ x
+
+
+luaRunST
+    :: (forall q . LuaState q s t)
+    -> ST s (Either String t)
+luaRunST = luaRunT resolveST resolveIO resolveYield onError onPure
+    where
+    resolveST act = act
+    resolveIO act = return $ Nothing
+    resolveYield vals = return $ Left $ errWrongYield
+    onError (LString msg)
+        = return $ Left $ BSt.unpack msg
+    onError _ = return $ Left $ "Unknown error"
+    onPure x = return $ Right $ x
+
+
 luaRunT
     :: (Monad m)
     => (forall a . ST s a -> m a)
@@ -504,7 +542,14 @@ luaRunT
     -> (t -> m u)
     -> (forall q . LuaState q s t)
     -> m u
-luaRunT = lxRunT
+luaRunT resolveST resolveIO resolveYield onError onPure act = do
+    lxRunT resolveST resolveIO resolveYield onError onPure (do
+        tr <- lxTry act
+        case tr of
+            Left err -> do
+                msg <- luaAsString err
+                luaError $ LString msg
+            Right x -> return $ x)
 
 
 luaSet
@@ -588,11 +633,11 @@ luaToRational _ = Nothing
 
 luaToString
     :: LuaValue q s
-    -> Maybe String
-luaToString x@(LInteger _) = Just $ show x
-luaToString x@(LRational _) = Just $ show x
-luaToString x@(LDouble _) = Just $ show x
-luaToString (LString b) = Just $ BSt.unpack b
+    -> Maybe BSt.ByteString
+luaToString x@(LInteger _) = Just $ BSt.pack $ show x
+luaToString x@(LRational _) = Just $ BSt.pack $ show x
+luaToString x@(LDouble _) = Just $ BSt.pack $ show x
+luaToString (LString b) = Just $ b
 luaToString _ = Nothing
 
 
@@ -615,6 +660,12 @@ luaTry
     :: LuaState q s t
     -> LuaState q s (Either (LuaValue q s) t)
 luaTry = lxTry
+
+
+luaTypename
+    :: LuaValue q s
+    -> BSt.ByteString
+luaTypename = lvalTypename
 
 
 luaWrite :: LuaRef q s a -> a -> LuaState q s ()

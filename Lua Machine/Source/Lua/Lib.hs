@@ -52,7 +52,15 @@ lualibs = do
                 LRational x -> return $ [LDouble $ fromRational x]
                 LDouble x -> return $ [a]
                 _ -> luaError $ errArgType 1 "number" a))]
-    elems <- mapM makef []
+    elems <- mapM makef [
+        ("assert", (\args -> do
+            let r:e:_ = luaExtend 2 args
+            if luaToBoolean r
+                then return $ args
+                else luaError e)),
+        ("error", (\args -> do
+            let e:_ = luaExtend 1 args
+            luaError e))]
     luaCreateTable (
         (LString "io", io)
         :(LString "math", math)

@@ -73,6 +73,8 @@ module Lua (
     luaRawSet,
     luaRead,
     luaResume,
+    luaRunIO,
+    luaRunST,
     luaRunT,
     luaSet,
     luaSetMetatable,
@@ -94,8 +96,6 @@ module Lua (
     luadWithinLocal,
     luaLoad,
     lualibs,
-    luaRunST,
-    luaRunIO,
 ) where
 
 import Control.Monad.ST
@@ -104,32 +104,3 @@ import Lua.Common
 import Lua.Debug
 import Lua.Interpret
 import Lua.Lib
-
-
-luaRunST
-    :: (forall q . LuaState q s t)
-    -> ST s (Either String t)
-luaRunST = luaRunT resolveST resolveIO resolveYield onError onPure
-    where
-    resolveST act = act
-    resolveIO act = return $ Nothing
-    resolveYield vals = return $ Left $ errWrongYield
-    onError (LString msg)
-        = return $ Left $ BSt.unpack msg
-    onError _ = return $ Left $ "Unknown error"
-    onPure x = return $ Right $ x
-
-
-luaRunIO
-    :: (forall q . LuaState q RealWorld t)
-    -> IO (Either String t)
-luaRunIO = luaRunT resolveST resolveIO resolveYield onError onPure
-    where
-    resolveST act = stToIO $ act
-    resolveIO act = Just <$> act
-    resolveYield vals = return $ Left $ errWrongYield
-    onError (LString msg)
-        = return $ Left $ BSt.unpack msg
-    onError _ = return $ Left $ "Unknown error"
-    onPure x = return $ Right $ x
-

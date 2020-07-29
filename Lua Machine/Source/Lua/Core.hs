@@ -36,8 +36,10 @@ module Lua.Core (
     errWrongYield,
     errZeroStep,
     lsfModifyLocals,
+    lvalTypename,
     lxAlloc,
     lxAllocTable,
+    lxAsString,
     lxAskStack,
     lxCall,
     lxCar,
@@ -164,21 +166,29 @@ data LuaMetatable q s t = LuaMetatable {
     lmtLt :: LuaMetaopBinary Bool q s t,
     lmtLe :: LuaMetaopBinary Bool q s t,
     lmtIndex
-        :: Maybe (t q s
-        -> LuaValue q s
-        -> LuaState q s (LuaValue q s)),
+        :: Maybe
+            (  t q s
+            -> LuaValue q s
+            -> LuaState q s (LuaValue q s)),
     lmtNewIndex
-        :: Maybe (t q s
-        -> LuaValue q s
-        -> LuaValue q s
-        -> LuaState q s ()),
+        :: Maybe
+            (  t q s
+            -> LuaValue q s
+            -> LuaValue q s
+            -> LuaState q s ()),
     lmtCall
-        :: Maybe (t q s
-        -> [LuaValue q s]
-        -> LuaState q s [LuaValue q s]),
+        :: Maybe
+            (  t q s
+            -> [LuaValue q s]
+            -> LuaState q s [LuaValue q s]),
     lmtClose
-        :: Maybe (t q s
-        -> LuaState q s ())}
+        :: Maybe
+            (  t q s
+            -> LuaState q s ()),
+    lmtToString
+        :: Maybe
+            (  t q s
+            -> LuaState q s BSt.ByteString)}
 
 
 lvalEmptyMetatable :: (Typeable t) => LuaMetatable q s t
@@ -189,7 +199,7 @@ lvalEmptyMetatable
         Nothing
         Nothing Nothing Nothing Nothing Nothing Nothing Nothing Nothing
         Nothing Nothing Nothing Nothing Nothing Nothing Nothing Nothing
-        Nothing Nothing Nothing Nothing Nothing Nothing Nothing
+        Nothing Nothing Nothing Nothing Nothing Nothing Nothing Nothing
 
 
 newtype LuaId = LuaId Int deriving (Show, Eq, Ord)
@@ -259,7 +269,38 @@ instance Show (LuaValue q s) where
     show (LInteger i) = show i
     show (LRational r) = show (numerator r) ++ "/" ++ show (denominator r)
     show (LDouble d) = show d
-    show (LString s) = show s
+    show (LString s) = "\"" ++ qstr (BSt.unpack s) ++ "\""
+        where
+        qstr "" = ""
+        qstr (c:cs)
+            | c < '\10' && not (dstart cs) =
+                '\\'
+                :d cn
+                :qstr cs
+            | c < '\32' && not (dstart cs) =
+                '\\'
+                :d (cn `div` 10)
+                :d (cn `mod` 10)
+                :qstr cs
+            | c < '\32' =
+                '\\':'0'
+                :d (cn `div` 10)
+                :d (cn `mod` 10)
+                :qstr cs
+            | c > '\126' =
+                '\\'
+                :d (cn `div` 100)
+                :d (cn `div` 10 `mod` 10)
+                :d (cn `mod` 10)
+                :qstr cs
+            | c == '\\' = '\\':'\\':qstr cs
+            | c == '"' = '\\':'"':qstr cs
+            | otherwise = c:qstr cs
+            where
+            cn = fromEnum c
+            d n = toEnum (n + fromEnum '0')
+        dstart "" = False
+        dstart (c:cs) = '0' <= c && c <= '9'
     show (LFunction (LuaId i) _) = "<function #" ++ show i ++ ">"
     show (LThread (LuaId i) _) = "<thread #" ++ show i ++ ">"
     show (LTable (LuaId i) _) = "<table #" ++ show i ++ ">"
@@ -762,7 +803,8 @@ lxProduceMetatable tvalue@(LTable _ table) = do
         lmtNewIndex =
             mkMetaopNewIndex <$!> M.lookup (LKString "__newindex") items,
         lmtCall = mkMetaopCall <$!> M.lookup (LKString "__call") items,
-        lmtClose = mkMetaopClose <$!> M.lookup (LKString "__close") items}
+        lmtClose = mkMetaopClose <$!> M.lookup (LKString "__close") items,
+        lmtToString = mkMetaopStr <$!> M.lookup (LKString "__tostring") items}
     return $ metatable
     where
     mkMetaopUnary f = \a -> lxCar <$> lxCall f [a]
@@ -782,6 +824,8 @@ lxProduceMetatable tvalue@(LTable _ table) = do
     mkMetaopNewIndex f = \a b c -> lxSet f b c
     mkMetaopCall f = \a args -> lxCall f (a:args)
     mkMetaopClose f = \a -> () <$ lxCall f [a]
+    mkMetaopString (LFunction _ ff) = \a -> lxAsString =<< (lxCar <$> ff [a])
+    mkMetaopStr f = \a -> lxAsString a
 lxProduceMetatable _ = return $ lvalEmptyMetatable
 
 
@@ -1171,6 +1215,30 @@ lxCall a args = do
                     Nothing -> lxError $ errWrongCall a)
 
 
+lxAsString
+    :: LuaValue q s
+    -> LuaState q s BSt.ByteString
+lxAsString a = do
+    case a of
+        LNil -> return $ BSt.pack $ show a
+        LBool _ -> return $ BSt.pack $ show a
+        LInteger _ -> return $ BSt.pack $ show a
+        LRational _ -> return $ BSt.pack $ show a
+        LDouble _ -> return $ BSt.pack $ show a
+        LString s -> return $ s
+        _ -> do
+            lxMetatable a (\x mt ->
+                case lmtToString mt of
+                    Just metaop -> do
+                        er <- lxTry $ metaop x
+                        case er of
+                            Left err -> do
+                                lxWarn err
+                                return $ BSt.pack $ show a
+                            Right r -> return $ r
+                    Nothing -> return $ BSt.pack $ show a)
+
+
 lxGet
     :: LuaValue q s
     -> LuaValue q s
@@ -1234,7 +1302,6 @@ lxAskStack
     :: LuaState q s [LuaStackFrame q s]
 lxAskStack = do
     lctxStack <$> ask
-
 
 
 lxLocalStack
