@@ -29,7 +29,7 @@ import qualified Data.ByteString.Lazy.Char8 as B
 import Control.Monad
 import Control.Monad.ST
 import Control.Monad.Trans
-import Text.Parsec.Char
+import Text.Parsec.Char hiding (hexDigit)
 import Text.Parsec.Combinator
 import Text.Parsec.Error
 import Text.Parsec.Pos
@@ -41,7 +41,7 @@ data TokenData
     = TokIdent BSt.ByteString
     | TokKeyword BSt.ByteString
     | TokInt Integer
-    | TokReal Rational
+    | TokReal Double
     | TokString BSt.ByteString
     | TokSymbol Int
     | TokEof
@@ -73,6 +73,7 @@ showTokenType (TokSymbol c)
         toEnum (c `div` 0x100 `mod` 0x100),
         toEnum (c `div` 0x10000),
         '\"']
+    | otherwise = show (TokSymbol c)
 showTokenType (TokEof) = "end of file"
 
 
@@ -80,18 +81,36 @@ within :: Char -> Char -> Char -> Bool
 within a b x = a <= x && x <= b
 
 
-type LParser s = ParsecT B.ByteString () (ST s)
+newtype CharSource = CharSource B.ByteString
+
+
+type LParser s = ParsecT CharSource () (ST s)
+
+
+instance Monad m => Stream CharSource m Char where
+    uncons (CharSource bstr0) = do
+        case B.uncons bstr0 of
+            Nothing -> return $ Nothing
+            Just (c1, bstr1) -> do
+                case B.uncons bstr1 of
+                    Nothing -> return $ Just (c1, CharSource bstr1)
+                    Just (c2, bstr2)
+                        | c1 == '\n' && c2 == '\r' -> do
+                            return $ Just ('\n', CharSource bstr2)
+                        | c1 == '\r' && c2 == '\n' -> do
+                            return $ Just ('\n', CharSource bstr2)
+                        | c1 == '\r' -> do
+                            return $ Just ('\n', CharSource bstr1)
+                        | otherwise -> return $ Just (c1, CharSource bstr1)
 
 
 lexWhitespace :: LParser s ()
-lexWhitespace = do
-    satisfy (\x -> within '\0' '\32' x)
-    return ()
+lexWhitespace = () <$ satisfy (\x -> within '\0' '\32' x)
 
 
 lexLongComment :: LParser s ()
 lexLongComment = do
-    char '['
+    _ <- char '['
     level <- ascend 0
     final <- optionMaybe (char '[')
     case final of
@@ -106,8 +125,8 @@ lexLongComment = do
 
     inner :: Int -> LParser s ()
     inner n = do
-        init <- optionMaybe (char ']')
-        case init of
+        cinit <- optionMaybe (char ']')
+        case cinit of
             Nothing -> anyChar >> inner n
             Just _ -> descend n n
 
@@ -123,12 +142,12 @@ lexLongComment = do
 
 lexLineComment :: LParser s ()
 lexLineComment = do
-    (satisfy (\x -> x /= '\n' && x /= '\r') >> lexLineComment) <|> return ()
+    (satisfy (/= '\n') >> lexLineComment) <|> return ()
 
 
 lexComment :: LParser s ()
 lexComment = do
-    try (string "--")
+    _ <- try (string "--")
     lexLongComment <|> lexLineComment
 
 
@@ -147,7 +166,7 @@ keywords = [
 
 lexWord :: LParser s TokenData
 lexWord = do
-    init <- satisfy (\x -> False
+    cinit <- satisfy (\x -> False
         || within 'a' 'z' x
         || within 'A' 'Z' x
         || x == '_')
@@ -156,7 +175,7 @@ lexWord = do
         || within 'A' 'Z' x
         || within '0' '9' x
         || x == '_'))
-    let word = BSt.pack (init:rest)
+    let word = BSt.pack (cinit:rest)
     if word `elem` keywords
         then return $ TokKeyword word
         else return $ TokIdent word
@@ -164,21 +183,23 @@ lexWord = do
 
 lexNumber :: LParser s TokenData
 lexNumber = do
-    lookAhead (try (do
+    _ <- lookAhead (try (do
         optional (char '.')
         satisfy (\x -> within '0' '9' x)))
     prefix <- optionMaybe (try (char '0' >> oneOf "xX"))
     let base = numberBase prefix
-    (inum, _) <- readInteger base
-    frac <- optionMaybe (readFraction base)
-    exp <- optionMaybe (readExponent base)
+    (inum, iden) <- readInteger base
+    fracpart <- optionMaybe (readFraction base)
+    exppart <- optionMaybe (readExponent base)
     notFollowedBy (satisfy (\x -> False
         || within '0' '9' x
         || within 'a' 'z' x
         || within 'A' 'Z' x
         || x == '_'
         || x == '.'))
-    case (frac, exp) of
+    case (fracpart, exppart) of
+        (Just (_, 1), _) | iden == 1 -> fail "Malformed number"
+        (Nothing, _) | iden == 1 -> fail "Malformed number"
         (Nothing, Nothing) ->
             return $ makeInt (base /= 10) inum
         (Just (fnum, fden), Nothing) ->
@@ -194,21 +215,23 @@ lexNumber = do
     numberBase Nothing = 10
     numberBase (Just c)
         | c == 'x' || c == 'X' = 16
+        | otherwise = undefined
 
     readFraction :: Int -> LParser s (Integer, Integer)
     readFraction base = do
-        char '.'
+        _ <- char '.'
         readInteger base
 
     readExponent :: Int -> LParser s (Integer, Integer)
     readExponent 10 = readExponentGen "eE" 10
     readExponent 16 = readExponentGen "pP" 2
+    readExponent _ = undefined
 
     readExponentGen :: [Char] -> Integer -> LParser s (Integer, Integer)
     readExponentGen echars ebase = do
-        oneOf echars
+        _ <- oneOf echars
         sign <- option ('+') (oneOf "+-")
-        lookAhead (satisfy (\x -> within '0' '9' x))
+        _ <- lookAhead (satisfy (\x -> within '0' '9' x))
         (val, _) <- readInteger 10
         if sign == '+'
             then return $ (ebase ^ val, 1)
@@ -232,14 +255,15 @@ lexNumber = do
             readDigitGen (num, den) 16 '0' '9' (fromEnum '0')
         <|> readDigitGen (num, den) 16 'a' 'f' (fromEnum 'a' - 10)
         <|> readDigitGen (num, den) 16 'A' 'F' (fromEnum 'A' - 10)
+    readDigit _ _ = undefined
 
     readDigitGen
         :: (Integer, Integer)
         -> Integer -> Char -> Char -> Int
         -> LParser s (Integer, Integer)
     readDigitGen (num, den) ibase firstch lastch choffset = do
-        char <- satisfy (\x -> within firstch lastch x)
-        let cval = toInteger (fromEnum char - choffset)
+        ch <- satisfy (\x -> within firstch lastch x)
+        let cval = toInteger (fromEnum ch - choffset)
         return $ (num * ibase + cval, den * ibase)
 
     makeInt :: Bool -> Integer -> TokenData
@@ -248,28 +272,28 @@ lexNumber = do
 
     makeReal :: (Integer, Integer) -> TokenData
     makeReal (num, den) = do
-        TokReal (num % den)
+        TokReal $ fromRational (num % den)
 
 
 lexShortString :: LParser s TokenData
 lexShortString = do
-    init <- oneOf "'\""
-    value <- readRest init
+    cinit <- oneOf "'\""
+    value <- readRest cinit
     return $ TokString (BSt.pack value)
 
     where
 
     readRest :: Char -> LParser s [Char]
-    readRest init
-        =   (satisfy (==init) >> return [])
+    readRest cinit
+        =   (satisfy (==cinit) >> return [])
         <|> (do
                 left <- readEscape <|> readCh
-                right <- readRest init
+                right <- readRest cinit
                 return (left ++ right))
 
     readEscape :: LParser s [Char]
     readEscape = do
-        char '\\'
+        _ <- char '\\'
         choice [
             char 'a' >> return "\7",
             char 'b' >> return "\8",
@@ -282,13 +306,12 @@ lexShortString = do
             char 'x' >> escHex,
             char 'u' >> escUtf,
             escDec,
-            escNewline,
             escSymbol]
 
     readCh :: LParser s [Char]
     readCh = do
-        char <- satisfy (\x -> x /= '\n' && x /= '\r')
-        return [char]
+        ch <- satisfy (/= '\n')
+        return [ch]
 
     escSpace :: LParser s [Char]
     escSpace = do
@@ -302,9 +325,9 @@ lexShortString = do
 
     escUtf :: LParser s [Char]
     escUtf = do
-        char '{'
+        _ <- char '{'
         str <- many1 hexDigit
-        char '}'
+        _ <- char '}'
         let value = foldl' (\a d -> a * 16 + toInteger (fromEnum d)) 0 str
         encodeUtf8 value
 
@@ -314,7 +337,7 @@ lexShortString = do
         mb <- optionMaybe decDigit
         mc <- optionMaybe decDigit
         case (mb, mc) of
-            (Nothing, Nothing) -> return $ [toEnum a]
+            (Nothing, _) -> return $ [toEnum a]
             (Just b, Nothing) -> return $ [toEnum (10*a + b)]
             (Just b, Just c) -> do
                 let v = 100*a + 10*b + c
@@ -322,21 +345,10 @@ lexShortString = do
                     then return $ [toEnum v]
                     else invalidCharcode
 
-    escNewline :: LParser s [Char]
-    escNewline = do
-        init <- oneOf "\n\r"
-        case init of
-            '\n' -> optional (char '\r')
-            '\r' -> optional (char '\n')
-        return $ "\n"
-
     escSymbol :: LParser s [Char]
     escSymbol = do
-        char <- satisfy (\x -> True
-            && not (within 'a' 'z' x)
-            && not (within 'A' 'Z' x)
-            && x /= '_')
-        return $ [char]
+        ch <- oneOf "\'\\\"\n"
+        return $ [ch]
 
     decDigit :: LParser s Int
     decDigit = do
@@ -350,8 +362,8 @@ lexShortString = do
 
     genDigit :: Char -> Char -> Int -> LParser s Int
     genDigit firstch lastch choffset = do
-        char <- satisfy (\x -> within firstch lastch x)
-        return $ fromEnum char - choffset
+        ch <- satisfy (\x -> within firstch lastch x)
+        return $ fromEnum ch - choffset
 
     encodeUtf8 :: Integer -> LParser s [Char]
     encodeUtf8 i = do
@@ -403,10 +415,11 @@ lexShortString = do
 
 lexLongString :: LParser s TokenData
 lexLongString = do
-    try (char '[' >> lookAhead (oneOf "[="))
+    _ <- try (char '[' >> lookAhead (oneOf "[="))
     level <- ascend 0
-    char '['
-    cont <- inner level
+    _ <- char '['
+    optional $ char '\n'
+    cont <- inner level id
     return $ TokString (BSt.pack cont)
 
     where
@@ -415,40 +428,28 @@ lexLongString = do
     ascend n = do
         (char '=' >> ascend (n+1)) <|> return n
 
-    inner :: Int -> LParser s [Char]
-    inner n = do
-        init <- optionMaybe (char ']')
-        case init of
+    inner :: Int -> ([Char] -> [Char]) -> LParser s [Char]
+    inner n buf = do
+        cinit <- optionMaybe (char ']')
+        case cinit of
             Nothing -> do
                 ch <- anyChar
-                case ch of
-                    '\n' -> optional (char '\r')
-                    '\r' -> optional (char '\n')
-                    _ -> return ()
-                rest <- inner n
-                let tch = if ch /= '\r'
-                    then ch
-                    else '\n'
-                return $ tch:rest
-            Just _ -> descend n n
+                inner n $ buf . (ch:)
+            Just _ -> descend n n buf
 
-    descend :: Int -> Int -> LParser s [Char]
-    descend n 0 = do
+    descend :: Int -> Int -> ([Char] -> [Char]) -> LParser s [Char]
+    descend n 0 buf = do
         final <- optionMaybe (char ']')
         case final of
             Nothing -> do
-                let head = replicate n '='
-                rest <- inner n
-                return $ ']':(head ++ rest)
-            Just _ -> return $ []
-    descend n i = do
+                inner n $ buf . ((']':replicate n '=') ++)
+            Just _ -> return $ buf ""
+    descend n i buf = do
         next <- optionMaybe (char '=')
         case next of
             Nothing -> do
-                let head = replicate (n-i) '='
-                rest <- inner n
-                return $ ']':(head ++ rest)
-            Just _ -> descend n (i-1)
+                inner n $ buf . ((']':replicate (n-i) '=') ++)
+            Just _ -> descend n (i-1) buf
 
 
 lexSymbol :: LParser s TokenData
@@ -470,7 +471,7 @@ lexSymbol = do
             mb <- optionMaybe (char '.')
             mc <- optionMaybe (char '.')
             case (mb, mc) of
-                (Nothing, Nothing) -> return $ TokSymbol (fromEnum a)
+                (Nothing, _) -> return $ TokSymbol (fromEnum a)
                 (Just _, Nothing) -> return $ TokSymbol (fromEnum a * 0x101)
                 (Just _, Just _) -> return $ TokSymbol (fromEnum a * 0x10101)
         | otherwise = return $ TokSymbol (fromEnum a)
@@ -502,15 +503,15 @@ newtype Cell s = Cell (STRef s (Maybe (Token, Cell s)))
 
 fetch :: Cell s -> LParser s (Token, Cell s)
 fetch (Cell ref) = do
-    cv <- lift (readSTRef ref)
+    cv <- lift $ readSTRef ref
     case cv of
         Just (tok, next) -> return $ (tok, next)
         Nothing -> do
             lexSpace
             tok <- lexToken
-            nref <- lift (newSTRef Nothing)
+            nref <- lift $ newSTRef Nothing
             let result = (tok, Cell nref)
-            lift (writeSTRef ref (Just result))
+            lift $ writeSTRef ref $ Just result
             return $ result
 
 
@@ -537,10 +538,10 @@ tokPrim f = do
 
 lexGrammar :: TokParser s a -> SourceName -> LParser s (Either ParseError a)
 lexGrammar gram name = do
-    init <- lift (newSTRef Nothing)
-    (Token (pr, _), next) <- fetch (Cell init)
+    first <- lift $ newSTRef Nothing
+    (Token (pr, _), _) <- fetch (Cell first)
     let ipos = rangeLeft pr
-    runParserT gram () name (TokenStream (Cell init, ipos))
+    runParserT gram () name (TokenStream (Cell first, ipos))
 
 
 parseGrammarST
@@ -549,7 +550,7 @@ parseGrammarST
     -> B.ByteString
     -> ST s (Either ParseError a)
 parseGrammarST gram name input = do
-    parseret <- runParserT (lexGrammar gram name) () name input
+    parseret <- runParserT (lexGrammar gram name) () name (CharSource input)
     return $ join parseret
 
 
@@ -595,7 +596,7 @@ tokInt = do
     <?> "integer"
 
 
-tokReal :: TokParser s (SourceRange, Rational)
+tokReal :: TokParser s (SourceRange, Double)
 tokReal = do
     tokPrim
         (\(Token (pr, td)) ->

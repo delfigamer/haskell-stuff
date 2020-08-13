@@ -1,20 +1,25 @@
-{-# LANGUAGE RankNTypes #-}
+{-# LANGUAGE BangPatterns #-}
+{-# LANGUAGE GADTs #-}
+{-# LANGUAGE FlexibleInstances #-}
 {-# LANGUAGE MultiParamTypeClasses #-}
 {-# LANGUAGE OverloadedStrings #-}
-{-# LANGUAGE GADTs #-}
+{-# LANGUAGE RankNTypes #-}
 
 
 module Lua.Core (
     LuaErrorHandler,
     LuaFunction,
-    LuaMetatable(..),
+    LuaIterator,
+    LuaMetatype(..),
+    LuaMetatypeWrapper(..),
     LuaPure(..),
     LuaRef,
     LuaStackFrame(..),
     LuaState,
-    LuaTableBody(..),
+    LuaTable(..),
     LuaValue(..),
     LuaVariableList,
+    errArgRange,
     errArgType,
     errDivideZero,
     errNilIndex,
@@ -33,6 +38,7 @@ module Lua.Core (
     errWrongRangeIter,
     errWrongTable,
     errWrongThreadFunc,
+    errWrongThreadStatus,
     errWrongYield,
     errZeroStep,
     lsfModifyLocals,
@@ -43,18 +49,20 @@ module Lua.Core (
     lxAskStack,
     lxCall,
     lxCar,
+    lxDefaultMetatable,
     lxError,
     lxExtend,
     lxFinally,
     lxGet,
-    lxGetTable,
-    lxKey,
+    lxGetDebugHook,
     lxLiftST,
     lxLocalStack,
     lxMetatable,
     lxNewId,
     lxNewThread,
     lxPerformBinary,
+    lxPerformMetaopBinary,
+    lxPerformMetaopUnary,
     lxPerformUnary,
     lxProduceMetatable,
     lxRawArithBNot,
@@ -67,14 +75,25 @@ module Lua.Core (
     lxRawArithUnm,
     lxRawCompare,
     lxRawCompareEq,
-    lxRawConcat,
     lxRawLen,
     lxRead,
     lxResume,
     lxRunT,
     lxSet,
-    lxSetTable,
+    lxSetBoolMetatable,
+    lxSetDebugHook,
+    lxSetFunctionMetatable,
+    lxSetNilMetatable,
+    lxSetNumberMetatable,
+    lxSetStringMetatable,
+    lxSetThreadMetatable,
+    lxSetWarnHandler,
+    lxTableGet,
+    lxTableIter,
     lxTableLength,
+    lxTableNext,
+    lxTableSet,
+    lxThreadState,
     lxTry,
     lxTryLiftIO,
     lxWithErrHandler,
@@ -90,13 +109,12 @@ import Control.Monad.ST
 import Data.Bits
 import Data.Maybe
 import Data.Ratio
-import Data.String
 import Data.STRef
 import Type.Reflection
 import qualified Data.ByteString.Char8 as BSt
-import qualified Data.Map.Strict as M
 import Lua.SourceRange
 import qualified Lua.Coroutine as Y
+import qualified Lua.Table as T
 
 
 data LuaHost s t where
@@ -134,83 +152,227 @@ instance Applicative (LuaHost s) where
 type LuaRef q s = STRef s
 
 
-type LuaMetaopUnary r q s t = Maybe (t q s -> LuaState q s r)
+type LuaMetaopUnary r q s t
+    =  t q s
+    -> LuaState q s r
+    -> LuaState q s r
 
 
-type LuaMetaopBinary r q s t = Maybe (
-    t q s -> LuaValue q s -> LuaState q s r,
-    LuaValue q s -> t q s -> LuaState q s r)
+type LuaMetaopBinary r q s t
+    =  t q s
+    -> LuaValue q s
+    -> Bool
+    -> LuaState q s r
+    -> LuaState q s r
 
 
-data LuaMetatable q s t = LuaMetatable {
-    lmtTypify :: forall a . ((Typeable t) => t q s -> a) -> t q s -> a,
-    lmtMetatable :: LuaValue q s,
-    lmtTypename :: (forall a . (IsString a) => Maybe a),
-    lmtAdd :: LuaMetaopBinary (LuaValue q s) q s t,
-    lmtSub :: LuaMetaopBinary (LuaValue q s) q s t,
-    lmtMul :: LuaMetaopBinary (LuaValue q s) q s t,
-    lmtDiv :: LuaMetaopBinary (LuaValue q s) q s t,
-    lmtMod :: LuaMetaopBinary (LuaValue q s) q s t,
-    lmtPow :: LuaMetaopBinary (LuaValue q s) q s t,
-    lmtUnm :: LuaMetaopUnary (LuaValue q s) q s t,
-    lmtIDiv :: LuaMetaopBinary (LuaValue q s) q s t,
-    lmtBAnd :: LuaMetaopBinary (LuaValue q s) q s t,
-    lmtBOr :: LuaMetaopBinary (LuaValue q s) q s t,
-    lmtBXor :: LuaMetaopBinary (LuaValue q s) q s t,
-    lmtBNot :: LuaMetaopUnary (LuaValue q s) q s t,
-    lmtShl :: LuaMetaopBinary (LuaValue q s) q s t,
-    lmtShr :: LuaMetaopBinary (LuaValue q s) q s t,
-    lmtConcat :: LuaMetaopBinary (LuaValue q s) q s t,
-    lmtLen :: LuaMetaopUnary (LuaValue q s) q s t,
-    lmtEq :: LuaMetaopBinary Bool q s t,
-    lmtLt :: LuaMetaopBinary Bool q s t,
-    lmtLe :: LuaMetaopBinary Bool q s t,
+class Typeable t => LuaMetatype t where
+    lmtMetatable :: t q s -> LuaValue q s
+    lmtTypename :: t q s -> Maybe BSt.ByteString
+    lmtAdd :: LuaMetaopBinary (LuaValue q s) q s t
+    lmtSub :: LuaMetaopBinary (LuaValue q s) q s t
+    lmtMul :: LuaMetaopBinary (LuaValue q s) q s t
+    lmtDiv :: LuaMetaopBinary (LuaValue q s) q s t
+    lmtMod :: LuaMetaopBinary (LuaValue q s) q s t
+    lmtPow :: LuaMetaopBinary (LuaValue q s) q s t
+    lmtUnm :: LuaMetaopUnary (LuaValue q s) q s t
+    lmtIDiv :: LuaMetaopBinary (LuaValue q s) q s t
+    lmtBAnd :: LuaMetaopBinary (LuaValue q s) q s t
+    lmtBOr :: LuaMetaopBinary (LuaValue q s) q s t
+    lmtBXor :: LuaMetaopBinary (LuaValue q s) q s t
+    lmtBNot :: LuaMetaopUnary (LuaValue q s) q s t
+    lmtShl :: LuaMetaopBinary (LuaValue q s) q s t
+    lmtShr :: LuaMetaopBinary (LuaValue q s) q s t
+    lmtConcat :: LuaMetaopBinary (LuaValue q s) q s t
+    lmtLen :: LuaMetaopUnary (LuaValue q s) q s t
+    lmtEq :: LuaMetaopBinary Bool q s t
+    lmtLt :: LuaMetaopBinary Bool q s t
+    lmtLe :: LuaMetaopBinary Bool q s t
     lmtIndex
-        :: Maybe
-            (  t q s
-            -> LuaValue q s
-            -> LuaState q s (LuaValue q s)),
+        :: t q s
+        -> LuaValue q s
+        -> LuaState q s (LuaValue q s)
+        -> LuaState q s (LuaValue q s)
     lmtNewIndex
-        :: Maybe
-            (  t q s
-            -> LuaValue q s
-            -> LuaValue q s
-            -> LuaState q s ()),
+        :: t q s
+        -> LuaValue q s
+        -> LuaValue q s
+        -> LuaState q s ()
+        -> LuaState q s ()
     lmtCall
-        :: Maybe
-            (  t q s
-            -> [LuaValue q s]
-            -> LuaState q s [LuaValue q s]),
-    lmtClose
-        :: Maybe
-            (  t q s
-            -> LuaState q s ()),
-    lmtToString
-        :: Maybe
-            (  t q s
-            -> LuaState q s BSt.ByteString)}
+        :: t q s
+        -> [LuaValue q s]
+        -> LuaState q s [LuaValue q s]
+        -> LuaState q s [LuaValue q s]
+    lmtClose :: t q s -> LuaState q s ()
+    lmtAsString
+        :: t q s
+        -> LuaState q s BSt.ByteString
+        -> LuaState q s BSt.ByteString
+    lmtShow
+        :: t q s -> String -> String
+    lmtMetatable _self = LNil
+    lmtTypename _self = Nothing
+    lmtAdd _self _other _rev def = def
+    lmtSub _self _other _rev def = def
+    lmtMul _self _other _rev def = def
+    lmtDiv _self _other _rev def = def
+    lmtMod _self _other _rev def = def
+    lmtPow _self _other _rev def = def
+    lmtUnm _self def = def
+    lmtIDiv _self _other _rev def = def
+    lmtBAnd _self _other _rev def = def
+    lmtBOr _self _other _rev def = def
+    lmtBXor _self _other _rev def = def
+    lmtBNot _self def = def
+    lmtShl _self _other _rev def = def
+    lmtShr _self _other _rev def = def
+    lmtConcat _self _other _rev def = def
+    lmtLen _self def = def
+    lmtEq _self _other _rev def = def
+    lmtLt _self _other _rev def = def
+    lmtLe _self _other _rev def = def
+    lmtIndex _self _index def = def
+    lmtNewIndex _self _index _value def = def
+    lmtCall _self _args def = def
+    lmtClose _self = return ()
+    lmtAsString _self def = def
+    lmtShow _self def = def
 
 
-lvalEmptyMetatable :: (Typeable t) => LuaMetatable q s t
-lvalEmptyMetatable
-    = LuaMetatable
-        ($)
-        LNil
-        Nothing
-        Nothing Nothing Nothing Nothing Nothing Nothing Nothing Nothing
-        Nothing Nothing Nothing Nothing Nothing Nothing Nothing Nothing
-        Nothing Nothing Nothing Nothing Nothing Nothing Nothing Nothing
+data LuaAnnotated q s = LuaAnnotated
+    !LuaId
+    !(LuaTable q s)
+    !(LuaValue q s)
+
+
+iimtParse
+    :: BSt.ByteString
+    -> LuaAnnotated q s
+    -> LuaState q s (LuaValue q s, LuaValue q s)
+iimtParse !metaname (LuaAnnotated _ (LuaTable tbody _) value) = do
+    (_, !metaop) <- lxLiftST $ T.get tbody (T.KString metaname)
+    return $ (value, metaop)
+
+
+iimtMetaopUnary
+    :: BSt.ByteString
+    -> LuaAnnotated q s
+    -> LuaState q s (LuaValue q s)
+    -> LuaState q s (LuaValue q s)
+iimtMetaopUnary !metaname !self def = do
+    (value, metaop) <- iimtParse metaname self
+    case metaop of
+        LNil -> def
+        f -> lxCar <$> lxCall f [value]
+
+
+iimtMetaopBinary
+    :: BSt.ByteString
+    -> LuaAnnotated q s
+    -> LuaValue q s
+    -> Bool
+    -> LuaState q s (LuaValue q s)
+    -> LuaState q s (LuaValue q s)
+iimtMetaopBinary !metaname !self !other !rev def = do
+    (value, metaop) <- iimtParse metaname self
+    case metaop of
+        LNil -> def
+        f -> case rev of
+            False -> lxCar <$> lxCall f [value, other]
+            True -> lxCar <$> lxCall f [other, value]
+
+
+iimtMetaopBinaryBool
+    :: BSt.ByteString
+    -> LuaAnnotated q s
+    -> LuaValue q s
+    -> Bool
+    -> LuaState q s Bool
+    -> LuaState q s Bool
+iimtMetaopBinaryBool !metaname !self !other !rev def = do
+    (value, metaop) <- iimtParse metaname self
+    case metaop of
+        LNil -> def
+        f -> case rev of
+            False -> listToBool <$> lxCall f [value, other]
+            True -> listToBool <$> lxCall f [other, value]
+    where
+    listToBool [] = False
+    listToBool (LNil:_) = False
+    listToBool (LBool False:_) = False
+    listToBool _ = True
+
+
+instance LuaMetatype LuaAnnotated where
+    lmtMetatable (LuaAnnotated lid table _) = LTable lid table
+    lmtAdd = iimtMetaopBinary "__add"
+    lmtSub = iimtMetaopBinary "__sub"
+    lmtMul = iimtMetaopBinary "__mul"
+    lmtDiv = iimtMetaopBinary "__div"
+    lmtMod = iimtMetaopBinary "__mod"
+    lmtPow = iimtMetaopBinary "__pow"
+    lmtUnm = iimtMetaopUnary "__unm"
+    lmtIDiv = iimtMetaopBinary "__idiv"
+    lmtBAnd = iimtMetaopBinary "__band"
+    lmtBOr = iimtMetaopBinary "__bor"
+    lmtBXor = iimtMetaopBinary "__bxor"
+    lmtBNot = iimtMetaopUnary "__bnot"
+    lmtShl = iimtMetaopBinary "__shl"
+    lmtShr = iimtMetaopBinary "__shr"
+    lmtConcat = iimtMetaopBinary "__concat"
+    lmtLen = iimtMetaopUnary "__len"
+    lmtEq = iimtMetaopBinaryBool "__eq"
+    lmtLt = iimtMetaopBinaryBool "__lt"
+    lmtLe = iimtMetaopBinaryBool "__le"
+    lmtIndex !self !index def = do
+        (value, metaop) <- iimtParse "__index" self
+        case metaop of
+            LNil -> def
+            LFunction _ ff -> lxCar <$> ff [value, index]
+            next -> lxGet next index
+    lmtNewIndex !self !index !new def = do
+        (value, metaop) <- iimtParse "__newindex" self
+        case metaop of
+            LNil -> def
+            LFunction _ ff -> () <$ ff [value, index, new]
+            next -> lxSet next index new
+    lmtCall !self args def = do
+        (value, metaop) <- iimtParse "__call" self
+        case metaop of
+            LNil -> def
+            next -> lxCall next (value:args)
+    lmtClose !self = do
+        (value, metaop) <- iimtParse "__close" self
+        case metaop of
+            LNil -> return ()
+            f -> () <$ lxCall f [value]
+    lmtAsString !self def = do
+        (value, metaop) <- iimtParse "__tostring" self
+        case metaop of
+            LNil -> def
+            LFunction _ ff -> lxAsString . lxCar =<< ff [value]
+            next -> lxAsString next
+
+
+newtype LuaUnannotated q s = LuaUnannotated (LuaValue q s)
+
+
+instance LuaMetatype LuaUnannotated
 
 
 newtype LuaId = LuaId Int deriving (Show, Eq, Ord)
 
 
-data LuaTableBody q s = LuaTableBody {
-    ltbItems :: M.Map (LuaKey q s) (LuaValue q s),
-    ltbMetatable :: LuaMetatable q s LuaValue}
+data LuaTable q s = LuaTable {
+    ltbBody :: T.Table s (LuaValue q s, LuaValue q s),
+    ltbMetatable :: LuaRef q s (LuaMetatypeWrapper q s)}
 
 
-type LuaTable q s = LuaRef q s (LuaTableBody q s)
+instance T.Nilable (LuaValue q s, LuaValue q s) where
+    nil = (LNil, LNil)
+    isNil (_, LNil) = True
+    isNil _ = False
 
 
 type LuaFunction q s = [LuaValue q s] -> LuaState q s [LuaValue q s]
@@ -219,13 +381,13 @@ type LuaFunction q s = [LuaValue q s] -> LuaState q s [LuaValue q s]
 data LuaThreadState q s
     = LTRunning
     | LTSuspended
-        (Either (LuaValue q s) [LuaValue q s]
+        !((Either (LuaValue q s) [LuaValue q s]
         -> Y.CoroutineT
             (Either (LuaValue q s) [LuaValue q s])
             [LuaValue q s]
             (LuaValue q s)
             (LuaHost s)
-            [LuaValue q s])
+            [LuaValue q s]))
     | LTNormal
     | LTDead
 
@@ -238,28 +400,87 @@ newtype LuaPure t q s = LuaPure t deriving (Show)
 
 data LuaValue q s where
     LNil :: LuaValue q s
-    LBool :: Bool -> LuaValue q s
-    LInteger :: Integer -> LuaValue q s
-    LRational :: Rational -> LuaValue q s
-    LDouble :: Double -> LuaValue q s
-    LString :: BSt.ByteString -> LuaValue q s
+    LBool :: !Bool -> LuaValue q s
+    LInteger :: !Integer -> LuaValue q s
+    LRational :: !Rational -> LuaValue q s
+    LDouble :: !Double -> LuaValue q s
+    LString :: !BSt.ByteString -> LuaValue q s
     LFunction
-        :: LuaId
+        :: !LuaId
         -> LuaFunction q s
         -> LuaValue q s
     LThread
-        :: LuaId
+        :: !LuaId
         -> LuaThread q s
         -> LuaValue q s
     LTable
-        :: LuaId
+        :: !LuaId
         -> LuaTable q s
         -> LuaValue q s
     LUserdata
-        :: LuaId
-        -> t q s
-        -> LuaMetatable q s t
+        :: (LuaMetatype t)
+        => !LuaId
+        -> !(t q s)
         -> LuaValue q s
+
+
+showRational :: Rational -> String
+showRational r = do
+    case rationalToDecimal (numerator r) (denominator r) 0 of
+        Nothing -> show (numerator r) ++ "/" ++ show (denominator r)
+        Just (x, dexp)
+            | x < 0 -> '-':showDecAbs (-x) dexp
+            | otherwise -> showDecAbs x dexp
+    where
+    showDecAbs x dexp = do
+        case ilog10 x dexp of
+            xlog
+                | xlog < -4 -> showDecAbsExp x dexp xlog
+                | xlog < 14 && dexp < 0 -> dtos x (1-dexp) (-dexp) ""
+                | xlog < 14 -> dtos (x * 10^(dexp+1)) 2 1 ""
+                | otherwise -> showDecAbsExp x dexp xlog
+    showDecAbsExp x dexp xlog = do
+        dtos x (1-dexp+xlog) (-dexp+xlog) xlogstr
+        where
+        xlogstr
+            | xlog < 0 = 'e':'-':itos (-xlog) 2 ""
+            | otherwise = 'e':'+':itos xlog 2 ""
+    rationalToDecimal :: Integer -> Integer -> Int -> Maybe (Integer, Int)
+    rationalToDecimal num den dexp
+        | den <= 0 = Nothing
+        | den == 1 = do
+            case num `divMod` 10 of
+                (0, 0) -> Just (num, dexp)
+                (numq, 0) -> rationalToDecimal numq den (dexp+1)
+                _ -> Just (num, dexp)
+        | let (denq, denr) = den `divMod` 10, denr == 0 = do
+            rationalToDecimal num denq (dexp-1)
+        | let (denq, denr) = den `divMod` 5, denr == 0 = do
+            rationalToDecimal (num*2) denq (dexp-1)
+        | let (denq, denr) = den `divMod` 2, denr == 0 = do
+            rationalToDecimal (num*5) denq (dexp-1)
+        | otherwise = Nothing
+    ilog10 :: Integer -> Int -> Int
+    ilog10 x dexp
+        | x < 10 = dexp
+        | otherwise = ilog10 (x `div` 10) (dexp + 1)
+    dtos :: Integer -> Int -> Int -> String -> String
+    dtos i digits decpt rest
+        | i == 0 && digits <= 0 && decpt < 0 = rest
+        | decpt == 0 = dtos i digits (-1) ('.':rest)
+        | i >= 0 = do
+            let (i', d) = i `divMod` 10
+            let ch = toEnum $ fromEnum d + fromEnum '0'
+            dtos i' (digits-1) (decpt-1) (ch:rest)
+        | otherwise = undefined
+    itos :: Int -> Int -> String -> String
+    itos i digits rest
+        | i == 0 && digits <= 0 = rest
+        | i >= 0 = do
+            let (i', d) = i `divMod` 10
+            let ch = toEnum $ fromEnum d + fromEnum '0'
+            itos i' (digits-1) (ch:rest)
+        | otherwise = undefined
 
 
 instance Show (LuaValue q s) where
@@ -267,12 +488,18 @@ instance Show (LuaValue q s) where
     show (LBool False) = "false"
     show (LBool True) = "true"
     show (LInteger i) = show i
-    show (LRational r) = show (numerator r) ++ "/" ++ show (denominator r)
+    show (LRational r) = showRational r
     show (LDouble d) = show d
     show (LString s) = "\"" ++ qstr (BSt.unpack s) ++ "\""
         where
         qstr "" = ""
         qstr (c:cs)
+            | c == '\n' =
+                '\\':'n'
+                :qstr cs
+            | c == '\r' =
+                '\\':'r'
+                :qstr cs
             | c < '\10' && not (dstart cs) =
                 '\\'
                 :d cn
@@ -300,38 +527,35 @@ instance Show (LuaValue q s) where
             cn = fromEnum c
             d n = toEnum (n + fromEnum '0')
         dstart "" = False
-        dstart (c:cs) = '0' <= c && c <= '9'
-    show (LFunction (LuaId i) _) = "<function #" ++ show i ++ ">"
-    show (LThread (LuaId i) _) = "<thread #" ++ show i ++ ">"
-    show (LTable (LuaId i) _) = "<table #" ++ show i ++ ">"
-    show (LUserdata (LuaId i) _ mt)
-        = "<" ++ fromMaybe "userdata" (lmtTypename mt)
-        ++ " #" ++ show i ++ ">"
+        dstart (c:_) = '0' <= c && c <= '9'
+    show (LFunction (LuaId i) _) = "<function: #" ++ show i ++ ">"
+    show (LThread (LuaId i) _) = "<thread: #" ++ show i ++ ">"
+    show (LTable (LuaId i) _) = "<table: #" ++ show i ++ ">"
+    show (LUserdata (LuaId i) x)
+        = lmtShow x $
+            "<" ++ BSt.unpack (fromMaybe "userdata" (lmtTypename x))
+            ++ ": #" ++ show i ++ ">"
 
 
-lvalTypename :: (IsString a) => LuaValue q s -> a
+lvalTypename :: LuaValue q s -> BSt.ByteString
 lvalTypename LNil = "nil"
 lvalTypename (LBool False) = "boolean"
 lvalTypename (LBool True) = "boolean"
-lvalTypename (LInteger i) = "number"
-lvalTypename (LRational r) = "number"
-lvalTypename (LDouble d) = "number"
-lvalTypename (LString s) = "string"
+lvalTypename (LInteger _) = "number"
+lvalTypename (LRational _) = "number"
+lvalTypename (LDouble _) = "number"
+lvalTypename (LString _) = "string"
 lvalTypename (LFunction _ _) = "function"
 lvalTypename (LThread _ _) = "thread"
 lvalTypename (LTable _ _) = "table"
-lvalTypename (LUserdata _ _ mt) = fromMaybe "userdata" (lmtTypename mt)
+lvalTypename (LUserdata _ x) = fromMaybe "userdata" (lmtTypename x)
 
 
-data LuaKey q s
-    = LKInteger Integer
-    | LKNil
-    | LKBool Bool
-    | LKRational Rational
-    | LKDouble Double
-    | LKString BSt.ByteString
-    | LKObject LuaId
-    deriving (Show, Ord, Eq)
+errArgRange
+    :: Int
+    -> LuaValue q s
+errArgRange n = LString $ BSt.concat [
+        "Argument ", BSt.pack (show n), " is out of range"]
 
 
 errArgType
@@ -420,6 +644,11 @@ errWrongThreadFunc a
     = LString $ BSt.concat [
         "Attempt to create a coroutine from ", lvalTypename a]
 
+errWrongThreadStatus :: LuaValue q s -> LuaValue q s
+errWrongThreadStatus a
+    = LString $ BSt.concat [
+        "Attempt to get a coroutine status from ", lvalTypename a]
+
 errWrongYield :: LuaValue q s
 errWrongYield = LString "Attempt to yield in a non-yieldable context"
 
@@ -427,15 +656,32 @@ errZeroStep :: LuaValue q s
 errZeroStep = LString "Attempt to perform a ranged for loop with step zero"
 
 
+data LuaMetatypeWrapper q s where
+    LuaMetatypeWrapper
+        :: (   forall u . (forall t . LuaMetatype t => t q s -> u)
+            -> LuaValue q s -> u)
+        -> LuaMetatypeWrapper q s
+
+
 data LuaEnvironment q s = LuaEnvironment {
-    lenvCounter :: LuaRef q s Int,
-    lenvNilMetatable :: LuaRef q s (LuaMetatable q s LuaValue),
-    lenvBoolMetatable :: LuaRef q s (LuaMetatable q s LuaValue),
-    lenvNumberMetatable :: LuaRef q s (LuaMetatable q s LuaValue),
-    lenvStringMetatable :: LuaRef q s (LuaMetatable q s LuaValue),
-    lenvFunctionMetatable :: LuaRef q s (LuaMetatable q s LuaValue),
-    lenvThreadMetatable :: LuaRef q s (LuaMetatable q s LuaValue),
-    lenvWarnHandler :: LuaRef q s (LuaValue q s -> LuaState q s ())}
+    lenvCounter
+        :: LuaRef q s Int,
+    lenvNilMetatable
+        :: LuaRef q s (LuaMetatypeWrapper q s),
+    lenvBoolMetatable
+        :: LuaRef q s (LuaMetatypeWrapper q s),
+    lenvNumberMetatable
+        :: LuaRef q s (LuaMetatypeWrapper q s),
+    lenvStringMetatable
+        :: LuaRef q s (LuaMetatypeWrapper q s),
+    lenvFunctionMetatable
+        :: LuaRef q s (LuaMetatypeWrapper q s),
+    lenvThreadMetatable
+        :: LuaRef q s (LuaMetatypeWrapper q s),
+    lenvWarnHandler
+        :: LuaRef q s (LuaValue q s -> LuaState q s ()),
+    lenvDebugHook
+        :: LuaRef q s (LuaValue q s, Bool, Bool, Bool)}
 
 
 type LuaErrorHandler q s = LuaValue q s -> LuaState q s (LuaValue q s)
@@ -503,18 +749,19 @@ lxRunT
     -> (t -> m u)
     -> (forall q . LuaState q s t)
     -> m u
-lxRunT resolveST resolveIO resolveYield onError onPure (LuaState act) = do
+lxRunT resolveST resolveIO resolveYield onError onPure (LuaState lstate) = do
     env <- resolveST $ LuaEnvironment
         <$> newSTRef 0
-        <*> newSTRef lvalEmptyMetatable
-        <*> newSTRef lvalEmptyMetatable
-        <*> newSTRef lvalEmptyMetatable
-        <*> newSTRef lvalEmptyMetatable
-        <*> newSTRef lvalEmptyMetatable
-        <*> newSTRef lvalEmptyMetatable
+        <*> newSTRef lxDefaultMetatable
+        <*> newSTRef lxDefaultMetatable
+        <*> newSTRef lxDefaultMetatable
+        <*> newSTRef lxDefaultMetatable
+        <*> newSTRef lxDefaultMetatable
+        <*> newSTRef lxDefaultMetatable
         <*> (newSTRef =<< makeDefaultWarnHandler)
+        <*> newSTRef (LNil, False, False, False)
     thread <- resolveST $ newSTRef LTRunning
-    driveY $ runReaderT act (LuaContext env return thread [])
+    driveY $ runReaderT lstate (LuaContext env return thread [])
     where
     driveY (Y.Pure x) = onPure x
     driveY (Y.Error e) = onError e
@@ -562,7 +809,7 @@ makeDefaultWarnHandler = do
             if isActive
                 then do
                     let msgStr = BSt.unpack msg
-                    lxTryLiftIO $ putStrLn $
+                    _ <- lxTryLiftIO $ putStrLn $
                         "Lua warning: " ++ msgStr
                     return ()
                 else return ()
@@ -598,7 +845,7 @@ lxWarn :: LuaValue q s -> LuaState q s ()
 lxWarn e = do
     env <- lctxEnvironment <$> ask
     warnh <- lxRead $ lenvWarnHandler env
-    lxTry (warnh e)
+    _ <- lxTry (warnh e)
     return ()
 
 
@@ -607,23 +854,23 @@ lxFinally fin act = do
     ar <- lxTry act
     fr <- lxTry fin
     case ar of
-        Left ae -> do
+        Left aerr -> do
             case fr of
-                Left fe -> lxWarn fe
+                Left ferr -> lxWarn ferr
                 Right _ -> return $ ()
-            LuaState $ lift $ Y.raise ae
-        Right ar -> do
+            LuaState $ lift $ Y.raise aerr
+        Right asuc -> do
             case fr of
-                Left fe -> LuaState $ lift $ Y.raise fe
-                Right _ -> return $ ar
+                Left ferr -> LuaState $ lift $ Y.raise ferr
+                Right _ -> return $ asuc
 
 
 lxLiftST :: ST s a -> LuaState q s a
-lxLiftST act = LuaState $ lift $ lift $ lhostLiftST $ act
+lxLiftST !act = LuaState $! lift $! lift $! lhostLiftST $! act
 
 
 lxTryLiftIO :: IO a -> LuaState q s (Maybe a)
-lxTryLiftIO act = LuaState $ lift $ lift $ lhostLiftIO $ act
+lxTryLiftIO !act = LuaState $! lift $! lift $! lhostLiftIO $! act
 
 
 lxAlloc :: a -> LuaState q s (LuaRef q s a)
@@ -635,7 +882,7 @@ lxRead ref = lxLiftST $ readSTRef ref
 
 
 lxWrite :: LuaRef q s a -> a -> LuaState q s ()
-lxWrite ref x = lxLiftST $ writeSTRef ref x
+lxWrite ref !x = lxLiftST $ writeSTRef ref x
 
 
 lxModify :: LuaRef q s a -> (a -> a) -> LuaState q s ()
@@ -687,6 +934,22 @@ lxResume thread ivals = do
         (driveHost . next) =<< lxTryLiftIO act
 
 
+lxThreadState
+    :: LuaThread q s
+    -> LuaState q s t
+    -> LuaState q s t
+    -> LuaState q s t
+    -> LuaState q s t
+    -> LuaState q s t
+lxThreadState thread onRunning onSuspended onNormal onDead = do
+    state <- lxRead thread
+    case state of
+        LTRunning -> onRunning
+        LTSuspended _ -> onSuspended
+        LTNormal -> onNormal
+        LTDead -> onDead
+
+
 lxNewId :: LuaState q s LuaId
 lxNewId = do
     ref <- lenvCounter . lctxEnvironment <$> ask
@@ -694,70 +957,107 @@ lxNewId = do
     LuaId <$> lxRead ref
 
 
-lxKey :: LuaValue q s -> LuaState q s (LuaKey q s)
-lxKey LNil = return $ LKNil
-lxKey (LBool b) = return $ LKBool b
-lxKey (LInteger i) = return $ LKInteger $ i
-lxKey (LRational r) =
-    if denominator r == 1
-        then return $ LKInteger $ numerator r
-        else return $ LKRational $ r
-lxKey (LDouble d) =
-    if isNaN d || isInfinite d
-        then return $ LKDouble d
-        else lxKey $ LRational $ toRational d
-lxKey (LString str) = return $ LKString $ str
-lxKey (LFunction i _) = return $ LKObject $ i
-lxKey (LThread i _) = return $ LKObject $ i
-lxKey (LTable i _ ) = return $ LKObject $ i
-lxKey (LUserdata i _ _) = return $ LKObject $ i
+lxKey :: LuaValue q s -> T.Key
+lxKey a = do
+    case a of
+        LNil -> T.KNil
+        LBool b -> T.KBool b
+        LInteger i -> asInteger i
+        LRational r -> asRational r
+        LDouble d
+            | isNaN d -> T.KNaN
+            | isInfinite d && d > 0 -> T.KPosInf
+            | isInfinite d -> T.KNegInf
+            | otherwise -> asRational $ toRational d
+        LString str -> T.KString $ str
+        LFunction (LuaId i) _ -> T.KId $ i
+        LThread (LuaId i) _ -> T.KId $ i
+        LTable (LuaId i) _ -> T.KId $ i
+        LUserdata (LuaId i) _ -> T.KId $ i
+    where
+    asInteger !i
+        | mini <= i && i <= maxi = T.KInt (fromInteger i)
+        | otherwise = T.KNumber $ toRational i
+    asRational !r
+        | denominator r == 1 = asInteger (numerator r)
+        | otherwise = T.KNumber $ r
+    mini = toInteger (minBound :: Int)
+    maxi = toInteger (maxBound :: Int)
 
 
 lxAllocTable
-    :: [(LuaKey q s, LuaValue q s)]
+    :: [(LuaValue q s, LuaValue q s)]
     -> LuaState q s (LuaTable q s)
 lxAllocTable elems = do
-    lxAlloc $ LuaTableBody (M.fromList elems) lvalEmptyMetatable
+    body <- lxLiftST $ do
+        body' <- T.new
+        flip fix elems $ \loop elems1 -> do
+            case elems1 of
+                (_, LNil):rest -> loop rest
+                (!kval, !vval):rest -> do
+                    T.set body' (lxKey kval) (kval, vval)
+                    loop rest
+                [] -> return ()
+        return $ body'
+    metaw <- lxAlloc $ lxDefaultMetatable
+    return $! LuaTable body metaw
 
 
-lxGetTable
-    :: LuaKey q s
-    -> LuaTable q s
-    -> LuaState q s (Maybe (LuaValue q s))
-lxGetTable key table = do
-    LuaTableBody items mt <- lxRead table
-    return $ M.lookup key items
-
-
-lxSetTable
-    :: LuaKey q s
+lxTableGet
+    :: LuaTable q s
     -> LuaValue q s
-    -> LuaTable q s
+    -> LuaState q s (LuaValue q s)
+lxTableGet (LuaTable body _) !key = do
+    snd <$> (lxLiftST $ T.get body (lxKey key))
+
+
+lxTableSet
+    :: LuaTable q s
+    -> LuaValue q s
+    -> LuaValue q s
     -> LuaState q s ()
-lxSetTable key LNil table = do
-    LuaTableBody items mt <- lxRead table
-    let items' = M.delete key items
-    lxWrite table $ LuaTableBody items' mt
-lxSetTable key value table = do
-    LuaTableBody items mt <- lxRead table
-    let items' = M.insert key value items
-    lxWrite table $ LuaTableBody items' mt
+lxTableSet (LuaTable body _) !key !value = do
+    lxLiftST $ T.set body (lxKey key) (key, value)
 
 
 lxTableLength
     :: LuaTable q s
     -> LuaState q s Integer
-lxTableLength table = do
-    LuaTableBody items mt <- lxRead table
-    case M.lookupLT LKNil items of
-        Just (ltk, _) ->
-            case ltk of
-                LKInteger x ->
-                    if x > 0
-                        then return $ x
-                        else return $ 0
-                _ -> return $ 0
-        Nothing -> return $ 0
+lxTableLength (LuaTable body _) = do
+    toInteger <$> (lxLiftST $ T.length body)
+
+
+data LuaIterator q s = LuaIterator
+    (T.Table s (LuaValue q s, LuaValue q s))
+    [T.Key]
+
+
+lxTableIter
+    :: LuaTable q s
+    -> LuaState q s (LuaIterator q s)
+lxTableIter (LuaTable body _) = do
+    ks <- lxLiftST $ T.keys body
+    return $! LuaIterator body ks
+
+
+lxTableNext
+    :: LuaIterator q s
+    -> LuaState q s a
+    -> (LuaIterator q s -> LuaValue q s -> LuaValue q s -> LuaState q s a)
+    -> LuaState q s a
+lxTableNext (LuaIterator body ks1) onEnd onIter = do
+    go ks1
+    where
+    go ks = do
+        case ks of
+            [] -> onEnd
+            (!k):rest -> do
+                (!key, !value) <- lxLiftST $ T.get body k
+                case value of
+                    LNil -> go rest
+                    _ -> do
+                        let !newiter = LuaIterator body rest
+                        onIter newiter key value
 
 
 lxExtend :: Int -> [LuaValue q s] -> [LuaValue q s]
@@ -768,171 +1068,191 @@ lxExtend n (x:xs) = x:lxExtend (n-1) xs
 
 lxCar :: [LuaValue q s] -> LuaValue q s
 lxCar [] = LNil
-lxCar (a:rest) = a
+lxCar (a:_) = a
+
+
+lxSetNilMetatable
+    :: LuaMetatypeWrapper q s
+    -> LuaState q s ()
+lxSetNilMetatable mt = do
+    env <- lctxEnvironment <$> ask
+    lxWrite (lenvNilMetatable env) mt
+
+
+lxSetBoolMetatable
+    :: LuaMetatypeWrapper q s
+    -> LuaState q s ()
+lxSetBoolMetatable mt = do
+    env <- lctxEnvironment <$> ask
+    lxWrite (lenvBoolMetatable env) mt
+
+
+lxSetNumberMetatable
+    :: LuaMetatypeWrapper q s
+    -> LuaState q s ()
+lxSetNumberMetatable mt = do
+    env <- lctxEnvironment <$> ask
+    lxWrite (lenvNumberMetatable env) mt
+
+
+lxSetStringMetatable
+    :: LuaMetatypeWrapper q s
+    -> LuaState q s ()
+lxSetStringMetatable mt = do
+    env <- lctxEnvironment <$> ask
+    lxWrite (lenvStringMetatable env) mt
+
+
+lxSetFunctionMetatable
+    :: LuaMetatypeWrapper q s
+    -> LuaState q s ()
+lxSetFunctionMetatable mt = do
+    env <- lctxEnvironment <$> ask
+    lxWrite (lenvFunctionMetatable env) mt
+
+
+lxSetThreadMetatable
+    :: LuaMetatypeWrapper q s
+    -> LuaState q s ()
+lxSetThreadMetatable mt = do
+    env <- lctxEnvironment <$> ask
+    lxWrite (lenvThreadMetatable env) mt
+
+
+lxSetWarnHandler
+    :: (LuaValue q s -> LuaState q s ())
+    -> LuaState q s ()
+lxSetWarnHandler wh = do
+    env <- lctxEnvironment <$> ask
+    lxWrite (lenvWarnHandler env) wh
+
+
+lxGetDebugHook
+    :: LuaState q s (LuaValue q s, Bool, Bool, Bool)
+lxGetDebugHook = do
+    env <- lctxEnvironment <$> ask
+    lxRead (lenvDebugHook env)
+
+
+lxSetDebugHook
+    :: (LuaValue q s, Bool, Bool, Bool)
+    -> LuaState q s ()
+lxSetDebugHook dh = do
+    env <- lctxEnvironment <$> ask
+    lxWrite (lenvDebugHook env) dh
+
+
+lxDefaultMetatable
+    :: LuaMetatypeWrapper q s
+lxDefaultMetatable = LuaMetatypeWrapper (. LuaUnannotated)
 
 
 lxProduceMetatable
     :: LuaValue q s
-    -> LuaState q s (LuaMetatable q s LuaValue)
-lxProduceMetatable tvalue@(LTable _ table) = do
-    LuaTableBody items mt <- lxRead table
-    let metatable = LuaMetatable {
-        lmtTypify = ($),
-        lmtMetatable = tvalue,
-        lmtTypename = Nothing,
-        lmtAdd = mkMetaopBinary <$!> M.lookup (LKString "__add") items,
-        lmtSub = mkMetaopBinary <$!> M.lookup (LKString "__sub") items,
-        lmtMul = mkMetaopBinary <$!> M.lookup (LKString "__mul") items,
-        lmtDiv = mkMetaopBinary <$!> M.lookup (LKString "__div") items,
-        lmtMod = mkMetaopBinary <$!> M.lookup (LKString "__mod") items,
-        lmtPow = mkMetaopBinary <$!> M.lookup (LKString "__pow") items,
-        lmtUnm = mkMetaopUnary <$!> M.lookup (LKString "__unm") items,
-        lmtIDiv = mkMetaopBinary <$!> M.lookup (LKString "__idiv") items,
-        lmtBAnd = mkMetaopBinary <$!> M.lookup (LKString "__band") items,
-        lmtBOr = mkMetaopBinary <$!> M.lookup (LKString "__bor") items,
-        lmtBXor = mkMetaopBinary <$!> M.lookup (LKString "__bxor") items,
-        lmtBNot = mkMetaopUnary <$!> M.lookup (LKString "__bnot") items,
-        lmtShl = mkMetaopBinary <$!> M.lookup (LKString "__shl") items,
-        lmtShr = mkMetaopBinary <$!> M.lookup (LKString "__shr") items,
-        lmtConcat = mkMetaopBinary <$!> M.lookup (LKString "__concat") items,
-        lmtLen = mkMetaopUnary <$!> M.lookup (LKString "__len") items,
-        lmtEq = mkMetaopBinaryBool <$!> M.lookup (LKString "__eq") items,
-        lmtLt = mkMetaopBinaryBool <$!> M.lookup (LKString "__lt") items,
-        lmtLe = mkMetaopBinaryBool <$!> M.lookup (LKString "__le") items,
-        lmtIndex = mkMetaopIndex <$!> M.lookup (LKString "__index") items,
-        lmtNewIndex =
-            mkMetaopNewIndex <$!> M.lookup (LKString "__newindex") items,
-        lmtCall = mkMetaopCall <$!> M.lookup (LKString "__call") items,
-        lmtClose = mkMetaopClose <$!> M.lookup (LKString "__close") items,
-        lmtToString = mkMetaopStr <$!> M.lookup (LKString "__tostring") items}
-    return $ metatable
-    where
-    mkMetaopUnary f = \a -> lxCar <$> lxCall f [a]
-    mkMetaopBinary f = (
-        \a b -> lxCar <$> lxCall f [a, b],
-        \a b -> lxCar <$> lxCall f [a, b])
-    mkMetaopBinaryBool f = (
-        \a b -> listToBool <$> lxCall f [a, b],
-        \a b -> listToBool <$> lxCall f [a, b])
-    listToBool (LNil:_) = False
-    listToBool (LBool False:_) = False
-    listToBool (_:_) = True
-    listToBool _ = False
-    mkMetaopIndex (LFunction _ ff) = \a b -> lxCar <$> ff [a, b]
-    mkMetaopIndex f = \a b -> lxGet f b
-    mkMetaopNewIndex (LFunction _ ff) = \a b c -> () <$ ff [a, b, c]
-    mkMetaopNewIndex f = \a b c -> lxSet f b c
-    mkMetaopCall f = \a args -> lxCall f (a:args)
-    mkMetaopClose f = \a -> () <$ lxCall f [a]
-    mkMetaopString (LFunction _ ff) = \a -> lxAsString =<< (lxCar <$> ff [a])
-    mkMetaopStr f = \a -> lxAsString a
-lxProduceMetatable _ = return $ lvalEmptyMetatable
+    -> LuaMetatypeWrapper q s
+lxProduceMetatable LNil = do
+    lxDefaultMetatable
+lxProduceMetatable (LTable lid table) = do
+    LuaMetatypeWrapper (. LuaAnnotated lid table)
+lxProduceMetatable _ = undefined
 
 
 lxMetatable
     :: LuaValue q s
-    -> (forall t . (Typeable t)
+    -> (forall t . (LuaMetatype t)
         => t q s
-        -> LuaMetatable q s t
         -> LuaState q s a)
     -> LuaState q s a
 lxMetatable x f = do
-    state <- lctxEnvironment <$> ask
     case x of
-        LNil -> f x =<< (lxRead $ lenvNilMetatable state)
-        LBool _ -> f x =<< (lxRead $ lenvBoolMetatable state)
-        LInteger _ -> f x =<< (lxRead $ lenvNumberMetatable state)
-        LRational _ -> f x =<< (lxRead $ lenvNumberMetatable state)
-        LDouble _ -> f x =<< (lxRead $ lenvNumberMetatable state)
-        LString _ -> f x =<< (lxRead $ lenvStringMetatable state)
-        LFunction _ _ -> f x =<< (lxRead $ lenvFunctionMetatable state)
-        LThread _ _ -> f x =<< (lxRead $ lenvThreadMetatable state)
-        LTable _ table -> f x =<< (ltbMetatable <$> lxRead table)
-        LUserdata _ ud mt -> lmtTypify mt f ud mt
+        LNil -> global lenvNilMetatable
+        LBool _ -> global lenvBoolMetatable
+        LInteger _ -> global lenvNumberMetatable
+        LRational _ -> global lenvNumberMetatable
+        LDouble _ -> global lenvNumberMetatable
+        LString _ -> global lenvStringMetatable
+        LFunction _ _ -> global lenvFunctionMetatable
+        LThread _ _ -> global lenvThreadMetatable
+        LTable _ (LuaTable _ pmeta) -> do
+            LuaMetatypeWrapper w <- lxRead pmeta
+            w f x
+        LUserdata _ ud -> f ud
+    where
+    global accf = do
+        state <- lctxEnvironment <$> ask
+        LuaMetatypeWrapper w <- lxRead $ accf state
+        w f x
 
 
 lxPerformMetaopUnary
-    :: (forall t . LuaMetatable q s t -> LuaMetaopUnary r q s t)
+    :: (forall t . LuaMetatype t => LuaMetaopUnary r q s t)
     -> LuaValue q s
-    -> LuaState q s (Maybe r)
-lxPerformMetaopUnary metaf a = do
-    lxMetatable a (\x mt ->
-        case metaf mt of
-            Just metaop -> Just <$> metaop x
-            Nothing -> return $ Nothing)
+    -> LuaState q s r
+    -> LuaState q s r
+lxPerformMetaopUnary metaf a def = do
+    lxMetatable a (\x -> metaf x $
+        def)
 
 
 lxPerformMetaopBinary
-    :: (forall t . LuaMetatable q s t -> LuaMetaopBinary r q s t)
+    :: (forall t . LuaMetatype t => LuaMetaopBinary r q s t)
     -> LuaValue q s
     -> LuaValue q s
-    -> LuaState q s (Maybe r)
-lxPerformMetaopBinary metaf a b = do
-    lxMetatable a (\x mta ->
-        lxMetatable b (\y mtb -> do
-            case metaf mta of
-                Just (ma, _) -> Just <$> ma x b
-                Nothing ->
-                    case metaf mtb of
-                        Just (_, mb) -> Just <$> mb a y
-                        Nothing -> return $ Nothing))
+    -> LuaState q s r
+    -> LuaState q s r
+lxPerformMetaopBinary metaf a b def = do
+    lxMetatable a (\x -> metaf x b False $
+        lxMetatable b (\y -> metaf y a True $
+            def))
 
 
 lxPerformUnary
-    :: (LuaValue q s -> LuaState q s (Maybe r))
-    -> (forall t . LuaMetatable q s t -> LuaMetaopUnary r q s t)
-    -> LuaState q s r
+    :: (LuaValue q s -> LuaState q s r -> LuaState q s r)
+    -> (forall t . LuaMetatype t => LuaMetaopUnary r q s t)
     -> LuaValue q s
     -> LuaState q s r
-lxPerformUnary raw metaf def a = do
-    rr <- raw a
-    case rr of
-        Just ret -> return $ ret
-        Nothing -> do
-            mr <- lxPerformMetaopUnary metaf a
-            case mr of
-                Just ret' -> return $ ret'
-                Nothing -> def
+    -> LuaState q s r
+lxPerformUnary raw metaf a def = do
+    raw a $
+        lxPerformMetaopUnary metaf a $
+            def
 
 
 lxPerformBinary
-    :: (LuaValue q s -> LuaValue q s -> LuaState q s (Maybe r))
-    -> (forall t . LuaMetatable q s t -> LuaMetaopBinary r q s t)
-    -> LuaState q s r
+    :: (LuaValue q s -> LuaValue q s -> LuaState q s r -> LuaState q s r)
+    -> (forall t . LuaMetatype t => LuaMetaopBinary r q s t)
     -> LuaValue q s
     -> LuaValue q s
     -> LuaState q s r
-lxPerformBinary raw metaf def a b = do
-    rr <- raw a b
-    case rr of
-        Just ret -> return $ ret
-        Nothing -> do
-            mr <- lxPerformMetaopBinary metaf a b
-            case mr of
-                Just ret' -> return $ ret'
-                Nothing -> def
+    -> LuaState q s r
+lxPerformBinary raw metaf a b def = do
+    raw a b $
+        lxPerformMetaopBinary metaf a b $
+            def
 
 
 lxRawArithUnm
     :: LuaValue q s
-    -> LuaState q s (Maybe (LuaValue q s))
-lxRawArithUnm a = do
+    -> LuaState q s (LuaValue q s)
+    -> LuaState q s (LuaValue q s)
+lxRawArithUnm a def = do
     case a of
-        LInteger x  -> return $ Just $ LInteger  $ negate x
-        LRational x -> return $ Just $ LRational $ negate x
-        LDouble x   -> return $ Just $ LDouble   $ negate x
-        _ -> return $ Nothing
+        LInteger x  -> return $ LInteger  $ negate x
+        LRational x -> return $ LRational $ negate x
+        LDouble x   -> return $ LDouble   $ negate x
+        _ -> def
 
 
 lxRawArithBNot
     :: LuaValue q s
-    -> LuaState q s (Maybe (LuaValue q s))
-lxRawArithBNot a = do
+    -> LuaState q s (LuaValue q s)
+    -> LuaState q s (LuaValue q s)
+lxRawArithBNot a def = do
     case a of
-        LInteger x  -> (Just . LInteger) <$> (complement <$> cvInt x)
-        LRational x -> (Just . LInteger) <$> (complement <$> cvRat x)
-        LDouble x   -> (Just . LInteger) <$> (complement <$> cvDbl x)
-        _ -> return $ Nothing
+        LInteger x  -> LInteger <$> (complement <$> cvInt x)
+        LRational x -> LInteger <$> (complement <$> cvRat x)
+        LDouble x   -> LInteger <$> (complement <$> cvDbl x)
+        _ -> def
     where
     cvInt x = return x
     cvRat x =
@@ -950,26 +1270,28 @@ lxRawArithNum
     :: (forall t . (Num t) => t -> t -> t)
     -> LuaValue q s
     -> LuaValue q s
-    -> LuaState q s (Maybe (LuaValue q s))
-lxRawArithNum op a b = do
-    return $ case (a, b) of
-        (LInteger  x, LInteger  y) -> Just $ LInteger  $ op x y
-        (LInteger  x, LRational y) -> Just $ LRational $ op (fromInteger x) y
-        (LInteger  x, LDouble   y) -> Just $ LDouble   $ op (fromInteger x) y
-        (LRational x, LInteger  y) -> Just $ LRational $ op x (fromInteger y)
-        (LRational x, LRational y) -> Just $ LRational $ op x y
-        (LRational x, LDouble   y) -> Just $ LDouble   $ op (fromRational x) y
-        (LDouble   x, LInteger  y) -> Just $ LDouble   $ op x (fromInteger y)
-        (LDouble   x, LRational y) -> Just $ LDouble   $ op x (fromRational y)
-        (LDouble   x, LDouble   y) -> Just $ LDouble   $ op x y
-        _ -> Nothing
+    -> LuaState q s (LuaValue q s)
+    -> LuaState q s (LuaValue q s)
+lxRawArithNum op a b def = do
+    case (a, b) of
+        (LInteger  x, LInteger  y) -> return $ LInteger  $ op x y
+        (LInteger  x, LRational y) -> return $ LRational $ op (fromInteger x) y
+        (LInteger  x, LDouble   y) -> return $ LDouble   $ op (fromInteger x) y
+        (LRational x, LInteger  y) -> return $ LRational $ op x (fromInteger y)
+        (LRational x, LRational y) -> return $ LRational $ op x y
+        (LRational x, LDouble   y) -> return $ LDouble   $ op (fromRational x) y
+        (LDouble   x, LInteger  y) -> return $ LDouble   $ op x (fromInteger y)
+        (LDouble   x, LRational y) -> return $ LDouble   $ op x (fromRational y)
+        (LDouble   x, LDouble   y) -> return $ LDouble   $ op x y
+        _ -> def
 
 
 lxRawArithDiv
     :: LuaValue q s
     -> LuaValue q s
-    -> LuaState q s (Maybe (LuaValue q s))
-lxRawArithDiv a b = do
+    -> LuaState q s (LuaValue q s)
+    -> LuaState q s (LuaValue q s)
+lxRawArithDiv a b def = do
     case (a, b) of
         (LInteger  x, LInteger  y) -> doInteger x y
         (LInteger  x, LRational y) -> doRational (fromInteger x) y
@@ -980,25 +1302,26 @@ lxRawArithDiv a b = do
         (LDouble   x, LInteger  y) -> doDouble x (fromInteger y)
         (LDouble   x, LRational y) -> doDouble x (fromRational y)
         (LDouble   x, LDouble   y) -> doDouble x y
-        _ -> return $ Nothing
+        _ -> def
     where
     doInteger x y =
         if y == 0
             then doDouble (fromInteger x) (fromInteger y)
-            else return $ Just $ LRational $ (fromInteger x) / (fromInteger y)
+            else return $ LRational $ (fromInteger x) / (fromInteger y)
     doRational x y =
         if y == 0
             then doDouble (fromRational x) (fromRational y)
-            else return $ Just $ LRational $ x / y
+            else return $ LRational $ x / y
     doDouble x y =
-        return $ Just $ LDouble $ x / y
+        return $ LDouble $ x / y
 
 
 lxRawArithIDiv
     :: LuaValue q s
     -> LuaValue q s
-    -> LuaState q s (Maybe (LuaValue q s))
-lxRawArithIDiv a b = do
+    -> LuaState q s (LuaValue q s)
+    -> LuaState q s (LuaValue q s)
+lxRawArithIDiv a b def = do
     case (a, b) of
         (LInteger  x, LInteger  y) -> doInteger x y
         (LInteger  x, LRational y) -> doRational (fromInteger x) y
@@ -1009,18 +1332,18 @@ lxRawArithIDiv a b = do
         (LDouble   x, LInteger  y) -> doDouble x (fromInteger y)
         (LDouble   x, LRational y) -> doDouble x (fromRational y)
         (LDouble   x, LDouble   y) -> doDouble x y
-        _ -> return $ Nothing
+        _ -> def
     where
     doInteger x y =
         if y == 0
             then lxError $ errDivideZero
-            else return $ Just $ LInteger $ div x y
+            else return $ LInteger $ div x y
     doRational x y =
         if y == 0
             then doDouble (fromRational x) (fromRational y)
-            else return $ Just $ LRational $ fromInteger (floor (x / y))
+            else return $ LRational $ fromInteger (floor (x / y))
     doDouble x y =
-        return $ Just $ LDouble $ let r = x / y in
+        return $ LDouble $ let r = x / y in
             if isNaN r || isInfinite r || isNegativeZero r
                 then r
                 else fromInteger (floor r)
@@ -1029,8 +1352,9 @@ lxRawArithIDiv a b = do
 lxRawArithMod
     :: LuaValue q s
     -> LuaValue q s
-    -> LuaState q s (Maybe (LuaValue q s))
-lxRawArithMod a b = do
+    -> LuaState q s (LuaValue q s)
+    -> LuaState q s (LuaValue q s)
+lxRawArithMod a b def = do
     case (a, b) of
         (LInteger  x, LInteger  y) -> doInteger x y
         (LInteger  x, LRational y) -> doRational (fromInteger x) y
@@ -1041,18 +1365,18 @@ lxRawArithMod a b = do
         (LDouble   x, LInteger  y) -> doDouble x (fromInteger y)
         (LDouble   x, LRational y) -> doDouble x (fromRational y)
         (LDouble   x, LDouble   y) -> doDouble x y
-        _ -> return $ Nothing
+        _ -> def
     where
     doInteger x y =
         if y == 0
             then lxError $ errDivideZero
-            else return $ Just $ LInteger $ mod x y
+            else return $ LInteger $ mod x y
     doRational x y =
         if y == 0
             then doDouble (fromRational x) (fromRational y)
-            else return $ Just $ LRational $ x - y * fromInteger (floor (x / y))
+            else return $ LRational $ x - y * fromInteger (floor (x / y))
     doDouble x y =
-        return $ Just $ LDouble $
+        return $ LDouble $
             if isInfinite y
                 then if y > 0
                     then x
@@ -1066,8 +1390,9 @@ lxRawArithMod a b = do
 lxRawArithPow
     :: LuaValue q s
     -> LuaValue q s
-    -> LuaState q s (Maybe (LuaValue q s))
-lxRawArithPow a b = do
+    -> LuaState q s (LuaValue q s)
+    -> LuaState q s (LuaValue q s)
+lxRawArithPow a b def = do
     case (a, b) of
         (LInteger  x, LInteger  y) -> doDouble (fromInteger x) (fromInteger y)
         (LInteger  x, LRational y) -> doDouble (fromInteger x) (fromRational y)
@@ -1078,38 +1403,39 @@ lxRawArithPow a b = do
         (LDouble   x, LInteger  y) -> doDouble x (fromInteger y)
         (LDouble   x, LRational y) -> doDouble x (fromRational y)
         (LDouble   x, LDouble   y) -> doDouble x y
-        _ -> return $ Nothing
+        _ -> def
     where
     doDouble x y =
-        return $ Just $ LDouble $ x ** y
+        return $ LDouble $ x ** y
 
 
 lxRawArithBitwise
     :: (Integer -> Integer -> Integer)
     -> LuaValue q s
     -> LuaValue q s
-    -> LuaState q s (Maybe (LuaValue q s))
-lxRawArithBitwise op a b = do
+    -> LuaState q s (LuaValue q s)
+    -> LuaState q s (LuaValue q s)
+lxRawArithBitwise op a b def = do
     case (a, b) of
         (LInteger  x, LInteger  y) ->
-            (Just . LInteger) <$> (op <$> (cvInt x) <*> (cvInt y))
+            LInteger <$> (op <$> (cvInt x) <*> (cvInt y))
         (LInteger  x, LRational y) ->
-            (Just . LInteger) <$> (op <$> (cvInt x) <*> (cvRat y))
+            LInteger <$> (op <$> (cvInt x) <*> (cvRat y))
         (LInteger  x, LDouble   y) ->
-            (Just . LInteger) <$> (op <$> (cvInt x) <*> (cvDbl y))
+            LInteger <$> (op <$> (cvInt x) <*> (cvDbl y))
         (LRational x, LInteger  y) ->
-            (Just . LInteger) <$> (op <$> (cvRat x) <*> (cvInt y))
+            LInteger <$> (op <$> (cvRat x) <*> (cvInt y))
         (LRational x, LRational y) ->
-            (Just . LInteger) <$> (op <$> (cvRat x) <*> (cvRat y))
+            LInteger <$> (op <$> (cvRat x) <*> (cvRat y))
         (LRational x, LDouble   y) ->
-            (Just . LInteger) <$> (op <$> (cvRat x) <*> (cvDbl y))
+            LInteger <$> (op <$> (cvRat x) <*> (cvDbl y))
         (LDouble   x, LInteger  y) ->
-            (Just . LInteger) <$> (op <$> (cvDbl x) <*> (cvInt y))
+            LInteger <$> (op <$> (cvDbl x) <*> (cvInt y))
         (LDouble   x, LRational y) ->
-            (Just . LInteger) <$> (op <$> (cvDbl x) <*> (cvRat y))
+            LInteger <$> (op <$> (cvDbl x) <*> (cvRat y))
         (LDouble   x, LDouble   y) ->
-            (Just . LInteger) <$> (op <$> (cvDbl x) <*> (cvDbl y))
-        _ -> return $ Nothing
+            LInteger <$> (op <$> (cvDbl x) <*> (cvDbl y))
+        _ -> def
     where
     cvInt x = return x
     cvRat x =
@@ -1127,78 +1453,59 @@ lxRawCompare
     :: (forall t . (Ord t) => t -> t -> Bool)
     -> LuaValue q s
     -> LuaValue q s
-    -> LuaState q s (Maybe Bool)
-lxRawCompare op a b = do
+    -> LuaState q s Bool
+    -> LuaState q s Bool
+lxRawCompare op a b def = do
     case (a, b) of
-        (LInteger  x, LInteger  y) -> return $ Just $ op x y
-        (LInteger  x, LRational y) -> return $ Just $ op (fromInteger x) y
-        (LInteger  x, LDouble   y) -> return $ Just $ doRatDbl (fromInteger x) y
-        (LRational x, LInteger  y) -> return $ Just $ op x (fromInteger y)
-        (LRational x, LRational y) -> return $ Just $ op x y
-        (LRational x, LDouble   y) -> return $ Just $ doRatDbl x y
-        (LDouble   x, LInteger  y) -> return $ Just $ doDblRat x (fromInteger y)
-        (LDouble   x, LRational y) -> return $ Just $ doDblRat x y
-        (LDouble   x, LDouble   y) -> return $ Just $ op x y
-        (LString x, LString y) -> return $ Just $ op x y
-        _ -> return $ Nothing
+        (LInteger  x, LInteger  y) -> return $ op x y
+        (LInteger  x, LRational y) -> return $ op (fromInteger x) y
+        (LInteger  x, LDouble   y) -> return $ doRatDbl (fromInteger x) y
+        (LRational x, LInteger  y) -> return $ op x (fromInteger y)
+        (LRational x, LRational y) -> return $ op x y
+        (LRational x, LDouble   y) -> return $ doRatDbl x y
+        (LDouble   x, LInteger  y) -> return $ doRatDbl (fromInteger y) x
+        (LDouble   x, LRational y) -> return $ doRatDbl y x
+        (LDouble   x, LDouble   y) -> return $ op x y
+        (LString x, LString y) -> return $ op x y
+        _ -> def
     where
     doRatDbl x y =
-        if isNaN y || isInfinite y
-            then op (fromRational x) y
-            else op x (toRational y)
-    doDblRat x y =
-        if isNaN x || isInfinite x
-            then op x (fromRational y)
-            else op (toRational x) y
+        if isNaN y
+            then False
+            else if isInfinite y
+                then op 0 y
+                else op x (toRational y)
 
 
 lxRawCompareEq
     :: LuaValue q s
     -> LuaValue q s
-    -> LuaState q s (Maybe Bool)
-lxRawCompareEq a b = do
-    case (a, b) of
-        (LInteger  x, LInteger  y) -> return $ Just $ x == y
-        (LInteger  x, LRational y) -> return $ Just $ (fromInteger x) == y
-        (LInteger  x, LDouble   y) -> return $ Just $ doRatDbl (fromInteger x) y
-        (LRational x, LInteger  y) -> return $ Just $ x == (fromInteger y)
-        (LRational x, LRational y) -> return $ Just $ x == y
-        (LRational x, LDouble   y) -> return $ Just $ doRatDbl x y
-        (LDouble   x, LInteger  y) -> return $ Just $ doRatDbl (fromInteger y) x
-        (LDouble   x, LRational y) -> return $ Just $ doRatDbl y x
-        (LDouble   x, LDouble   y) -> return $ Just $ x == y
-        (LString x, LString y) -> return $ Just $ x == y
-        _ -> do
-            ka <- lxKey a
-            kb <- lxKey b
-            if ka == kb
-                then return $ Just $ True
-                else return $ Nothing
-    where
-    doRatDbl x y =
-        if isNaN y || isInfinite y
-            then (fromRational x) == y
-            else x == (toRational y)
-
-
-lxRawConcat
-    :: LuaValue q s
-    -> LuaValue q s
-    -> LuaState q s (Maybe (LuaValue q s))
-lxRawConcat a b = do
-    case (a, b) of
-        (LString x, LString y) -> return $ Just $ LString $ BSt.concat [x, y]
-        _ -> return $ Nothing
+    -> LuaState q s Bool
+    -> LuaState q s Bool
+lxRawCompareEq a b def = do
+    let ka = lxKey a
+    let kb = lxKey b
+    if ka == T.KNaN || kb == T.KNaN
+        then return $ False
+        else if ka == kb
+            then return $ True
+            else case (a, b) of
+                (LTable _ _, _) -> def
+                (LUserdata _ _, _) -> def
+                (_, LTable _ _) -> def
+                (_, LUserdata _ _) -> def
+                _ -> return $ False
 
 
 lxRawLen
     :: LuaValue q s
-    -> LuaState q s (Maybe Integer)
-lxRawLen a = do
+    -> LuaState q s Integer
+    -> LuaState q s Integer
+lxRawLen a def = do
     case a of
-        LString x -> return $ Just $ toInteger (BSt.length x)
-        LTable _ table -> Just <$> lxTableLength table
-        _ -> return $ Nothing
+        LString x -> return $ toInteger (BSt.length x)
+        LTable _ table -> lxTableLength table
+        _ -> def
 
 
 lxCall
@@ -1209,10 +1516,8 @@ lxCall a args = do
     case a of
         LFunction _ f -> f args
         _ -> do
-            lxMetatable a (\x mt ->
-                case lmtCall mt of
-                    Just metaop -> metaop x args
-                    Nothing -> lxError $ errWrongCall a)
+            lxMetatable a (\x -> lmtCall x args $
+                lxError $ errWrongCall a)
 
 
 lxAsString
@@ -1220,23 +1525,21 @@ lxAsString
     -> LuaState q s BSt.ByteString
 lxAsString a = do
     case a of
-        LNil -> return $ BSt.pack $ show a
-        LBool _ -> return $ BSt.pack $ show a
-        LInteger _ -> return $ BSt.pack $ show a
-        LRational _ -> return $ BSt.pack $ show a
-        LDouble _ -> return $ BSt.pack $ show a
+        LNil -> def
+        LBool _ -> def
+        LInteger _ -> def
+        LRational _ -> def
+        LDouble _ -> def
         LString s -> return $ s
         _ -> do
-            lxMetatable a (\x mt ->
-                case lmtToString mt of
-                    Just metaop -> do
-                        er <- lxTry $ metaop x
-                        case er of
-                            Left err -> do
-                                lxWarn err
-                                return $ BSt.pack $ show a
-                            Right r -> return $ r
-                    Nothing -> return $ BSt.pack $ show a)
+            er <- lxTry $ lxMetatable a (\x -> lmtAsString x $ def)
+            case er of
+                Left err -> do
+                    lxWarn err
+                    def
+                Right r -> return $ r
+    where
+    def = return $ BSt.pack $ show a
 
 
 lxGet
@@ -1249,18 +1552,14 @@ lxGet a b = do
             case b of
                 LNil -> metaGet $ return LNil
                 _ -> do
-                    key <- lxKey b
-                    result <- lxGetTable key table
+                    result <- lxTableGet table b
                     case result of
-                        Just ret -> return $ ret
-                        Nothing -> metaGet $ return LNil
+                        LNil -> metaGet $ return LNil
+                        _ -> return $ result
         _ -> metaGet $ lxError $ errWrongTable a
     where
     metaGet def = do
-        lxMetatable a (\x mt ->
-            case lmtIndex mt of
-                Just metaop -> metaop x b
-                Nothing -> def)
+        lxMetatable a (\x -> lmtIndex x b $ def)
 
 
 lxSet
@@ -1274,28 +1573,17 @@ lxSet a b c = do
             case b of
                 LNil -> metaSet $ lxError $ errNilIndex
                 _ -> do
-                    key <- lxKey b
-                    lxMetatable a (\x mt ->
-                        case lmtNewIndex mt of
-                            Just metaop -> do
-                                LuaTableBody items mt <- lxRead table
-                                case M.alterF alterBody key items of
-                                    Nothing -> metaop x b c
-                                    Just items' -> do
-                                        lxWrite table $ LuaTableBody items' mt
-                            Nothing -> lxSetTable key c table)
+                    result <- lxTableGet table b
+                    case result of
+                        LNil -> lxMetatable a (\x ->
+                            lmtNewIndex x b c $
+                                lxTableSet table b c)
+                        _ -> lxTableSet table b c
         _ -> metaSet $ lxError $ errWrongTable a
     where
-    alterBody (Just oldv) =
-        case c of
-            LNil -> Just $ Nothing
-            _ -> Just $ Just c
-    alterBody (Nothing) = Nothing
     metaSet def = do
-        lxMetatable a (\x mt ->
-            case lmtNewIndex mt of
-                Just metaop -> metaop x b c
-                Nothing -> def)
+        lxMetatable a (\x -> do
+            lmtNewIndex x b c $ def)
 
 
 lxAskStack

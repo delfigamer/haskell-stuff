@@ -15,7 +15,6 @@ module Lua.Parse (
 ) where
 
 
-import Data.Ratio
 import qualified Data.ByteString.Char8 as BSt
 import qualified Data.ByteString.Lazy.Char8 as B
 import Text.Parsec.Combinator
@@ -30,7 +29,7 @@ data NameNode = NameNode (SourceRange, BSt.ByteString) deriving (Show)
 
 
 instance DefString NameNode where
-    defString d (NameNode (_, name)) rest
+    defString _ (NameNode (_, name)) rest
         = unpackSt name $ rest
 
 
@@ -38,7 +37,7 @@ newtype VarargNode = VarargNode SourceRange deriving (Show)
 
 
 instance DefString VarargNode where
-    defString d (VarargNode _)
+    defString _ (VarargNode _)
         = "..."
 
 
@@ -46,7 +45,7 @@ data Expression
     = ExprNil
     | ExprBool Bool
     | ExprInt Integer
-    | ExprReal Rational
+    | ExprReal Double
     | ExprString BSt.ByteString
     | ExprEllipsis
     | ExprFunction
@@ -62,6 +61,7 @@ data Expression
     | ExprBinary BinaryOp ExprNode ExprNode
     | ExprAnd ExprNode ExprNode
     | ExprOr ExprNode ExprNode
+    | ExprGroup ExprNode
     deriving (Show)
 
 
@@ -97,32 +97,32 @@ data BinaryOp
 
 
 instance DefString UnaryOp where
-    defString d UnaryNot = "not"
-    defString d UnaryLength = "#"
-    defString d UnaryMinus = "-"
-    defString d UnaryBNot = "~"
+    defString _ UnaryNot = "not"
+    defString _ UnaryLength = "#"
+    defString _ UnaryMinus = "-"
+    defString _ UnaryBNot = "~"
 
 
 instance DefString BinaryOp where
-    defString d BinaryPower = "^"
-    defString d BinaryTimes = "*"
-    defString d BinaryDivide = "/"
-    defString d BinaryFloorDiv = "//"
-    defString d BinaryModulo = "%"
-    defString d BinaryPlus = "+"
-    defString d BinaryMinus = "-"
-    defString d BinaryConcat = ".."
-    defString d BinaryLShift = "<<"
-    defString d BinaryRShift = ">>"
-    defString d BinaryBAnd = "&"
-    defString d BinaryBXor = "~"
-    defString d BinaryBOr = "|"
-    defString d BinaryLess = "<"
-    defString d BinaryGreater = ">"
-    defString d BinaryLessEqual = "<="
-    defString d BinaryGreaterEqual = ">="
-    defString d BinaryNotEqual = "~="
-    defString d BinaryEqual = "=="
+    defString _ BinaryPower = "^"
+    defString _ BinaryTimes = "*"
+    defString _ BinaryDivide = "/"
+    defString _ BinaryFloorDiv = "//"
+    defString _ BinaryModulo = "%"
+    defString _ BinaryPlus = "+"
+    defString _ BinaryMinus = "-"
+    defString _ BinaryConcat = ".."
+    defString _ BinaryLShift = "<<"
+    defString _ BinaryRShift = ">>"
+    defString _ BinaryBAnd = "&"
+    defString _ BinaryBXor = "~"
+    defString _ BinaryBOr = "|"
+    defString _ BinaryLess = "<"
+    defString _ BinaryGreater = ">"
+    defString _ BinaryLessEqual = "<="
+    defString _ BinaryGreaterEqual = ">="
+    defString _ BinaryNotEqual = "~="
+    defString _ BinaryEqual = "=="
 
 
 newtype ExprNode = ExprNode (SourceRange, Expression) deriving (Show)
@@ -145,21 +145,24 @@ isPrefixExpr _ = False
 
 defFunctionHeadless :: Int -> ExprNode -> ShowS
 defFunctionHeadless
-        d (ExprNode (pr, ExprFunction params vararg body)) rest
+        d (ExprNode (_, ExprFunction params vararg body)) rest
     = "(" $ paramStr params vararg $ ")"
         $ defString (d+1) body $ defBr d $ "end" $ rest
 
     where
 
-    paramStr [] Nothing rest = rest
-    paramStr [] (Just va) rest = defString d va $ rest
-    paramStr ns Nothing rest = defList ", " d ns $ rest
-    paramStr ns (Just va) rest
-        = defList ", " d ns $ ", " $ defString d va $ rest
+    paramStr [] Nothing rest' = rest'
+    paramStr [] (Just va) rest' = defString d va $ rest'
+    paramStr ns Nothing rest' = defList ", " d ns $ rest'
+    paramStr ns (Just va) rest'
+        = defList ", " d ns $ ", " $ defString d va $ rest'
+
+
+defFunctionHeadless _ _ _ = undefined
 
 
 defTableBody :: Int -> [(Maybe ExprNode, ExprNode)] -> ShowS
-defTableBody d [] rest = rest
+defTableBody _ [] rest = rest
 defTableBody d [(Just key, value)] rest
     = defBr d $ "[" $ defString d key $ "] = "
         $ defString d value $ rest
@@ -179,30 +182,30 @@ defPrefixExpr d expr rest
 
 
 instance DefString ExprNode where
-    defString d (ExprNode (pr, ExprNil)) rest
+    defString _ (ExprNode (_, ExprNil)) rest
         = "nil" $ rest
-    defString d (ExprNode (pr, ExprBool False)) rest
+    defString _ (ExprNode (_, ExprBool False)) rest
         = "false" $ rest
-    defString d (ExprNode (pr, ExprBool True)) rest
+    defString _ (ExprNode (_, ExprBool True)) rest
         = "true" $ rest
-    defString d (ExprNode (pr, ExprInt n)) rest
+    defString _ (ExprNode (_, ExprInt n)) rest
         = shows n $ rest
-    defString d (ExprNode (pr, ExprReal n)) rest
-        = shows (numerator n) $ "/" $ shows (denominator n) $ rest
-    defString d (ExprNode (pr, ExprString s)) rest
+    defString _ (ExprNode (_, ExprReal n)) rest
+        = shows n $ rest
+    defString _ (ExprNode (_, ExprString s)) rest
         = shows s $ rest
-    defString d (ExprNode (pr, ExprEllipsis)) rest
+    defString _ (ExprNode (_, ExprEllipsis)) rest
         = "..." $ rest
-    defString d e@(ExprNode (pr, ExprFunction _ _ _)) rest
+    defString d e@(ExprNode (_, ExprFunction _ _ _)) rest
         = "function" $ defFunctionHeadless d e $ rest
-    defString d (ExprNode (pr, ExprTable xs Nothing)) rest
+    defString d (ExprNode (_, ExprTable xs Nothing)) rest
         = "{" $ defTableBody (d+1) xs $ "}" $ rest
-    defString d (ExprNode (pr, ExprTable xs (Just last))) rest
-        = "{" $ defTableBody (d+1) (xs ++ [(Nothing, last)])
+    defString d (ExprNode (_, ExprTable xs (Just elast))) rest
+        = "{" $ defTableBody (d+1) (xs ++ [(Nothing, elast)])
             $ " --[[multret]]}" $ rest
-    defString d (ExprNode (pr, ExprVar name)) rest
+    defString d (ExprNode (_, ExprVar name)) rest
         = defString d name $ rest
-    defString d (ExprNode (pr, ExprIndex table key)) rest = do
+    defString d (ExprNode (_, ExprIndex table key)) rest = do
         case identKey key of
             Just name -> defPrefixExpr d table $ "." $ unpackSt name $ rest
             Nothing -> defPrefixExpr d table
@@ -213,28 +216,30 @@ instance DefString ExprNode where
                 then Just str
                 else Nothing
         identKey _ = Nothing
-    defString d (ExprNode (pr, ExprCall func args Nothing)) rest
+    defString d (ExprNode (_, ExprCall func args Nothing)) rest
         = defPrefixExpr d func $ "(" $ defList ", " d args $ ")" $ rest
-    defString d (ExprNode (pr, ExprCall func args (Just last))) rest
-        = defPrefixExpr d func $ "(" $ defList ", " d (args ++ [last])
+    defString d (ExprNode (_, ExprCall func args (Just elast))) rest
+        = defPrefixExpr d func $ "(" $ defList ", " d (args ++ [elast])
             $ " --[[multret]])" $ rest
-    defString d (ExprNode (pr, ExprMethodCall obj name args Nothing)) rest
+    defString d (ExprNode (_, ExprMethodCall obj name args Nothing)) rest
         = defPrefixExpr d obj $ ":" $ unpackSt name
             $ "(" $ defList ", " d args $ ")" $ rest
-    defString d (ExprNode (pr, ExprMethodCall obj name args (Just last))) rest
+    defString d (ExprNode (_, ExprMethodCall obj name args (Just elast))) rest
         = defPrefixExpr d obj $ ":" $ unpackSt name
-            $ "(" $ defList ", " d (args ++ [last]) $ " --[[multret]])" $ rest
-    defString d (ExprNode (pr, ExprUnary op x)) rest
+            $ "(" $ defList ", " d (args ++ [elast]) $ " --[[multret]])" $ rest
+    defString d (ExprNode (_, ExprUnary op x)) rest
         = "(" $ defString d op $ " " $ defString d x $ ")" $ rest
-    defString d (ExprNode (pr, ExprBinary op x y)) rest
+    defString d (ExprNode (_, ExprBinary op x y)) rest
         = "(" $ defString d x $ " " $ defString d op $ " "
             $ defString d y $ ")" $ rest
-    defString d (ExprNode (pr, ExprAnd x y)) rest
+    defString d (ExprNode (_, ExprAnd x y)) rest
         = "(" $ defString d x $ " and "
             $ defString d y $ ")" $ rest
-    defString d (ExprNode (pr, ExprOr x y)) rest
+    defString d (ExprNode (_, ExprOr x y)) rest
         = "(" $ defString d x $ " or "
             $ defString d y $ ")" $ rest
+    defString d (ExprNode (_, ExprGroup x)) rest
+        = "(" $ defString d x $ ")" $ rest
 
 
 data Statement
@@ -270,7 +275,7 @@ newtype StatNode = StatNode (SourceRange, Statement) deriving (Show)
 
 
 defNameAttrs :: Int -> [(NameNode, Maybe BSt.ByteString)] -> ShowS
-defNameAttrs d [] rest = rest
+defNameAttrs _ [] rest = rest
 defNameAttrs d [(name, Nothing)] rest
     = defString d name $ rest
 defNameAttrs d [(name, Just attr)] rest
@@ -283,108 +288,103 @@ defNameAttrs d ((name, Just attr):x:xs) rest
 
 
 instance DefString StatNode where
-    defString d (StatNode (pr, StatNull)) rest
+    defString _ (StatNode (_, StatNull)) rest
         = ";" $ rest
-    defString d (StatNode (pr, StatAssign lhs rhs Nothing)) rest
+    defString d (StatNode (_, StatAssign lhs rhs Nothing)) rest
         = defList ", " d lhs $ " = " $ defList ", " d rhs $ ";" $ rest
-    defString d (StatNode (pr, StatAssign lhs rhs (Just last))) rest
-        = defList ", " d lhs $ " = " $ defList ", " d (rhs ++ [last])
+    defString d (StatNode (_, StatAssign lhs rhs (Just elast))) rest
+        = defList ", " d lhs $ " = " $ defList ", " d (rhs ++ [elast])
             $ " --[[multret]];" $ rest
-    defString d (StatNode (pr, StatInvoke e)) rest
+    defString d (StatNode (_, StatInvoke e)) rest
         = defString d e $ ";" $ rest
-    defString d (StatNode (pr, StatLabel name)) rest
+    defString d (StatNode (_, StatLabel name)) rest
         = "::" $ defString d name $ "::;" $ rest
-    defString d (StatNode (pr, StatBreak)) rest
+    defString _ (StatNode (_, StatBreak)) rest
         = "break;" $ rest
-    defString d (StatNode (pr, StatGoto name)) rest
+    defString d (StatNode (_, StatGoto name)) rest
         = "goto " $ defString d name $ ";" $ rest
-    defString d (StatNode (pr, StatDo body)) rest
+    defString d (StatNode (_, StatDo body)) rest
         = "do" $ defString (d+1) body $ defBr d $ "end;" $ rest
-    defString d (StatNode (pr, StatWhile cond body)) rest
+    defString d (StatNode (_, StatWhile cond body)) rest
         = "while " $ defString d cond $ " do"
             $ defString (d+1) body $ defBr d $ "end;" $ rest
-    defString d (StatNode (pr, StatRepeat body cond)) rest
+    defString d (StatNode (_, StatRepeat body cond)) rest
         = "repeat" $ defString (d+1) body
             $ "until " $ defString d cond $ ";" $ rest
-    defString d (StatNode (pr, StatIf cond body alt)) rest
+    defString d (StatNode (_, StatIf cond body alt)) rest
         = "if " $ defString d cond $ " then"
             $ defString (d+1) body $ defBr d $ next alt $ rest
         where
         next :: StatNode -> ShowS
-        next (StatNode (pr, StatNull)) rest
-            = "end;" $ rest
-        next (StatNode (pr, StatIf cond body alt)) rest
-            = "elseif " $ defString d cond $ " then"
-                $ defString (d+1) body $ defBr d $ next alt $ rest
-        next (StatNode (pr, StatDo body)) rest
-            = "else" $ defString (d+1) body $ defBr d $ "end;" $ rest
-        next stat rest
-            = "else" $ defString (d+1) [stat] $ defBr d $ "end;" $ rest
-    defString d (StatNode (pr, StatForNum pvar a b Nothing body)) rest
+        next (StatNode (_, StatNull)) rest'
+            = "end;" $ rest'
+        next (StatNode (_, StatIf cond' body' alt')) rest'
+            = "elseif " $ defString d cond' $ " then"
+                $ defString (d+1) body' $ defBr d $ next alt' $ rest'
+        next (StatNode (_, StatDo body')) rest'
+            = "else" $ defString (d+1) body' $ defBr d $ "end;" $ rest'
+        next stat rest'
+            = "else" $ defString (d+1) [stat] $ defBr d $ "end;" $ rest'
+    defString d (StatNode (_, StatForNum pvar a b Nothing body)) rest
         = "for " $ defString d pvar $ " = "
             $ defString d a $ ", " $ defString d b
             $ " do" $ defString (d+1) body $ defBr d $ "end;" $ rest
-    defString d (StatNode (pr, StatForNum pvar a b (Just st) body)) rest
+    defString d (StatNode (_, StatForNum pvar a b (Just st) body)) rest
         = "for " $ defString d pvar $ " = "
             $ defString d a $ ", " $ defString d b $ ", " $ defString d st
             $ " do" $ defString (d+1) body $ defBr d $ "end;" $ rest
-    defString d (StatNode (pr, StatForEach pvars rhs Nothing body)) rest
+    defString d (StatNode (_, StatForEach pvars rhs Nothing body)) rest
         = "for " $ defList ", " d pvars  $ " in "
             $ defList ", " d rhs $ " do"
             $ defString (d+1) body $ defBr d $ "end;" $ rest
-    defString d (StatNode (pr, StatForEach pvars rhs (Just last) body)) rest
+    defString d (StatNode (_, StatForEach pvars rhs (Just elast) body)) rest
         = "for " $ defList ", " d pvars  $ " in "
-            $ defList ", " d (rhs ++ [last]) $ " --[[multret]] do"
+            $ defList ", " d (rhs ++ [elast]) $ " --[[multret]] do"
             $ defString (d+1) body $ defBr d $ "end;" $ rest
-    defString d (StatNode (pr, StatFunction lhs fvalue)) rest
+    defString d (StatNode (_, StatFunction lhs fvalue)) rest
         = "function " $ defString d lhs
             $ defFunctionHeadless d fvalue $ ";" $ rest
-    defString d (StatNode (pr, StatLocalFunction name fvalue body)) rest
+    defString d (StatNode (_, StatLocalFunction name fvalue body)) rest
         = "local function " $ defString d name
             $ defFunctionHeadless d fvalue $ ";"
             $ defString d body $ defBr d
             $ "--[[unlocal " $ defString d name $ "]]" $ rest
-    defString d (StatNode (pr, StatLocalDef nameattrs [] Nothing body)) rest
+    defString d (StatNode (_, StatLocalDef nameattrs [] Nothing body)) rest
         = "local " $ defNameAttrs d nameattrs $ ";"
             $ defString d body $ defBr d
             $ "--[[unlocal " $ defNameAttrs d nameattrs $ "]]" $ rest
-    defString d (StatNode (pr,
-            StatLocalDef nameattrs [] (Just last) body)) rest
+    defString d (StatNode (_,
+            StatLocalDef nameattrs [] (Just elast) body)) rest
         = "local " $ defNameAttrs d nameattrs $ " = "
-            $ defString d last $ " --[[multret]];"
+            $ defString d elast $ " --[[multret]];"
             $ defString d body $ defBr d
             $ "--[[unlocal " $ defNameAttrs d nameattrs $ "]]" $ rest
-    defString d (StatNode (pr, StatLocalDef nameattrs rhs Nothing body)) rest
+    defString d (StatNode (_, StatLocalDef nameattrs rhs Nothing body)) rest
         = "local " $ defNameAttrs d nameattrs $ " = "
             $ defList ", " d rhs $ ";"
             $ defString d body $ defBr d
             $ "--[[unlocal " $ defNameAttrs d nameattrs $ "]]" $ rest
-    defString d (StatNode (pr,
-            StatLocalDef nameattrs rhs (Just last) body)) rest
+    defString d (StatNode (_,
+            StatLocalDef nameattrs rhs (Just elast) body)) rest
         = "local " $ defNameAttrs d nameattrs $ " = "
-            $ defList ", " d (rhs ++ [last]) $ " --[[multret]];"
+            $ defList ", " d (rhs ++ [elast]) $ " --[[multret]];"
             $ defString d body $ defBr d
             $ "--[[unlocal " $ defNameAttrs d nameattrs $ "]]" $ rest
-    defString d (StatNode (pr, StatReturn [] Nothing)) rest
+    defString _ (StatNode (_, StatReturn [] Nothing)) rest
         = "return;" $ rest
-    defString d (StatNode (pr, StatReturn [] (Just last))) rest
-        = "return " $ defString d last $ " --[[multret]];" $ rest
-    defString d (StatNode (pr, StatReturn rhs Nothing)) rest
+    defString d (StatNode (_, StatReturn [] (Just elast))) rest
+        = "return " $ defString d elast $ " --[[multret]];" $ rest
+    defString d (StatNode (_, StatReturn rhs Nothing)) rest
         = "return " $ defList ", " d rhs $ ";" $ rest
-    defString d (StatNode (pr, StatReturn rhs (Just last))) rest
-        = "return " $ defList ", " d (rhs ++ [last]) $ " --[[multret]];" $ rest
+    defString d (StatNode (_, StatReturn rhs (Just elast))) rest
+        = "return " $ defList ", " d (rhs ++ [elast]) $ " --[[multret]];" $ rest
 
 
 instance DefString [StatNode] where
-    defString d [] rest
+    defString _ [] rest
         = rest
     defString d (x:xs) rest
         = defBr d $ defString d x $ defString d xs $ rest
-
-
-defChunkString :: [StatNode] -> ShowS
-defChunkString stats rest
-    = defList "\n" 0 stats $ rest
 
 
 gramName :: TokParser s NameNode
@@ -396,7 +396,7 @@ gramName = do
 gramChunk :: TokParser s [StatNode]
 gramChunk = do
     body <- gramBlock
-    tokEof
+    _ <- tokEof
     return $ body
 
 
@@ -407,7 +407,7 @@ gramBlock = do
             stat <- gramReturnStat
             return $ [stat],
         do
-            tokSymbol ";"
+            _ <- tokSymbol ";"
             gramBlock,
         do
             stat <- gramScopingStat
@@ -451,14 +451,14 @@ gramSingleStat = do
         do
             pra <- tokKeyword "while"
             cond <- gramExpr
-            tokKeyword "do"
+            _ <- tokKeyword "do"
             body <- gramBlock
             prb <- tokKeyword "end"
             return $ StatNode (pra <> prb, StatWhile cond body),
         do
             pra <- tokKeyword "repeat"
             body <- gramBlock
-            tokKeyword "until"
+            _ <- tokKeyword "until"
             cond@(ExprNode (prb, _)) <- gramExpr
             return $ StatNode (pra <> prb, StatRepeat body cond),
         gramIfStat,
@@ -475,7 +475,7 @@ gramIfStat :: TokParser s StatNode
 gramIfStat = do
     pra <- tokKeyword "if"
     cond <- gramExpr
-    tokKeyword "then"
+    _ <- tokKeyword "then"
     body <- gramBlock
     (prb, alt) <- readAlt
     return $ StatNode (pra <> prb, StatIf cond body alt)
@@ -489,7 +489,7 @@ gramIfStat = do
     readElseif = do
         pra <- tokKeyword "elseif"
         cond <- gramExpr
-        tokKeyword "then"
+        _ <- tokKeyword "then"
         body <- gramBlock
         (prb, alt) <- readAlt
         return $ (pra <> prb, StatNode (pra <> prb, StatIf cond body alt))
@@ -519,35 +519,35 @@ gramForStat = do
 
     readNameList :: TokParser s [NameNode]
     readNameList = do
-        init <- gramName
+        tinit <- gramName
         choice [
             do
-                tokSymbol ","
+                _ <- tokSymbol ","
                 rest <- readNameList
-                return $ init:rest,
-            return $ [init]]
+                return $ tinit:rest,
+            return $ [tinit]]
 
 
 gramForNumStat :: SourceRange -> NameNode -> TokParser s StatNode
 gramForNumStat pra name = do
-    tokSymbol "="
-    init <- gramExpr
-    tokSymbol ","
-    final <- gramExpr
+    _ <- tokSymbol "="
+    tinit <- gramExpr
+    _ <- tokSymbol ","
+    tfinal <- gramExpr
     mstep <- optionMaybe (do
-        tokSymbol ","
+        _ <- tokSymbol ","
         gramExpr)
-    tokKeyword "do"
+    _ <- tokKeyword "do"
     body <- gramBlock
     prb <- tokKeyword "end"
-    return $ StatNode (pra <> prb, StatForNum name init final mstep body)
+    return $ StatNode (pra <> prb, StatForNum name tinit tfinal mstep body)
 
 
 gramForEachStat :: SourceRange -> [NameNode] -> TokParser s StatNode
 gramForEachStat pra names = do
-    tokKeyword "in"
+    _ <- tokKeyword "in"
     (_, rhs, mlast) <- gramExprList
-    tokKeyword "do"
+    _ <- tokKeyword "do"
     body <- gramBlock
     prb <- tokKeyword "end"
     return $ StatNode (pra <> prb, StatForEach names rhs mlast body)
@@ -555,7 +555,7 @@ gramForEachStat pra names = do
 
 gramFunctionStat :: TokParser s StatNode
 gramFunctionStat = do
-    try (lookAhead (tokKeyword "function" >> tokIdent))
+    _ <- try (lookAhead (tokKeyword "function" >> tokIdent))
     pra <- tokKeyword "function"
     (target, isMethod) <- readTarget
     func@(ExprNode (prb, _)) <- gramMethodFunctionBody isMethod
@@ -574,14 +574,14 @@ gramFunctionStat = do
 
     suffixIndex :: ExprNode -> TokParser s (ExprNode, Bool)
     suffixIndex base@(ExprNode (pra, _)) = do
-        tokSymbol "."
+        _ <- tokSymbol "."
         (prb, name) <- tokIdent
         let index = ExprNode (prb, ExprString name)
         suffixes $ ExprNode (pra <> prb, ExprIndex base index)
 
     suffixMethod :: ExprNode -> TokParser s (ExprNode, Bool)
     suffixMethod base@(ExprNode (pra, _)) = do
-        tokSymbol ":"
+        _ <- tokSymbol ":"
         (prb, name) <- tokIdent
         let index = ExprNode (prb, ExprString name)
         return $ (ExprNode (pra <> prb, ExprIndex base index), True)
@@ -589,9 +589,9 @@ gramFunctionStat = do
 
 gramLocalFunctionStat :: TokParser s ([StatNode] -> StatNode)
 gramLocalFunctionStat = do
-    try (lookAhead (tokKeyword "local" >> tokKeyword "function"))
+    _ <- try (lookAhead (tokKeyword "local" >> tokKeyword "function"))
     pra <- tokKeyword "local"
-    tokKeyword "function"
+    _ <- tokKeyword "function"
     name <- gramName
     func@(ExprNode (prb, _)) <- gramFunctionBody
     return $ (\body ->
@@ -612,23 +612,23 @@ gramLocalStat = do
         mattr <- optionMaybe readAttr
         choice [
             do
-                tokSymbol ","
+                _ <- tokSymbol ","
                 rest <- readNameattrs
                 return $ (name, mattr):rest,
             return $ [(name, mattr)]]
 
     readAttr :: TokParser s BSt.ByteString
     readAttr = do
-        tokSymbol "<"
+        _ <- tokSymbol "<"
         (_, attr) <- tokIdent
-        tokSymbol ">"
+        _ <- tokSymbol ">"
         return $ attr
 
     localInit
         :: SourceRange -> [(NameNode, Maybe BSt.ByteString)]
         -> TokParser s ([StatNode] -> StatNode)
     localInit pra nameattrs = do
-        tokSymbol "="
+        _ <- tokSymbol "="
         (prb, rhs, mlast) <- gramExprList
         return $ (\body ->
             StatNode (pra <> prb, StatLocalDef nameattrs rhs mlast body))
@@ -646,7 +646,7 @@ gramExprStat = do
     (pra, lhs', mlast) <- gramExprList
     let lhs = case mlast of
             Nothing -> lhs'
-            Just last -> lhs' ++ [last]
+            Just tlast -> lhs' ++ [tlast]
     case lhs of
         [expr] -> assignment pra lhs <|> invocation pra expr
         _ -> assignment pra lhs
@@ -655,7 +655,7 @@ gramExprStat = do
 
     assignment :: SourceRange -> [ExprNode] -> TokParser s StatNode
     assignment pra lhs = do
-        tokSymbol "="
+        _ <- tokSymbol "="
         (prb, rhs, mlast) <- gramExprList
         return $ StatNode (pra <> prb, StatAssign lhs rhs mlast)
 
@@ -666,15 +666,15 @@ gramExprStat = do
 
 gramExprList :: TokParser s (SourceRange, [ExprNode], Maybe ExprNode)
 gramExprList = do
-    init@(ExprNode(pra, _)) <- gramExpr
+    tinit@(ExprNode(pra, _)) <- gramExpr
     choice [
         do
-            tokSymbol ","
+            _ <- tokSymbol ","
             (prb, rest, mlast) <- gramExprList
-            return $ (pra <> prb, init:rest, mlast),
-        if isMultretExpr init
-            then return $ (pra, [], Just init)
-            else return $ (pra, [init], Nothing)]
+            return $ (pra <> prb, tinit:rest, mlast),
+        if isMultretExpr tinit
+            then return $ (pra, [], Just tinit)
+            else return $ (pra, [tinit], Nothing)]
 
 
 gramExpr :: TokParser s ExprNode
@@ -688,10 +688,10 @@ gramExpr = do
         base@(ExprNode (pra, _)) <- gramTermExpr
         choice [
             do
-                tokSymbol "^"
-                exp@(ExprNode (prb, _)) <- readPrefix
+                _ <- tokSymbol "^"
+                eexp@(ExprNode (prb, _)) <- readPrefix
                 return $
-                    ExprNode (pra <> prb, ExprBinary BinaryPower base exp),
+                    ExprNode (pra <> prb, ExprBinary BinaryPower base eexp),
             return $ base]
 
     readPrefix :: TokParser s ExprNode
@@ -727,7 +727,9 @@ gramExpr = do
     readShift :: TokParser s ExprNode
     readShift = do
         chainr1 readJoin $
-            binaryOp (tokSymbol "..") (ExprBinary BinaryConcat)
+            choice [
+                binaryOp (tokSymbol "<<") (ExprBinary BinaryLShift),
+                binaryOp (tokSymbol ">>") (ExprBinary BinaryRShift)]
 
     readBitAnd :: TokParser s ExprNode
     readBitAnd = do
@@ -780,7 +782,7 @@ gramExpr = do
         -> (ExprNode -> ExprNode -> Expression)
         -> TokParser s (ExprNode -> ExprNode -> ExprNode)
     binaryOp parser builder = do
-        parser
+        _ <- parser
         return $ (\left@(ExprNode (pra, _)) right@(ExprNode (prb, _)) ->
             ExprNode (pra <> prb, builder left right))
 
@@ -798,7 +800,7 @@ gramTermExpr = do
             pr <- tokSymbol "..."
             return $ ExprNode (pr, ExprEllipsis),
         do
-            pr <- tokKeyword "function"
+            _ <- tokKeyword "function"
             gramFunctionBody,
         gramTableExpr,
         gramSuffixExpr]
@@ -814,8 +816,8 @@ gramTermExpr = do
         :: TokParser s (SourceRange, a)
         -> (a -> Expression)
         -> TokParser s ExprNode
-    literal parse construct = do
-        (pr, v) <- parse
+    literal parser construct = do
+        (pr, v) <- parser
         return $ ExprNode (pr, construct v)
 
 
@@ -828,7 +830,7 @@ gramMethodFunctionBody :: Bool -> TokParser s ExprNode
 gramMethodFunctionBody isMethod = do
     pra <- tokSymbol "("
     (params, vararg) <- gramParamList
-    tokSymbol ")"
+    _ <- tokSymbol ")"
     let params' =
             if isMethod
                 then (NameNode (pra, "self")):params
@@ -857,7 +859,7 @@ gramParamList = do
         name <- gramName
         choice [
             do
-                tokSymbol ","
+                _ <- tokSymbol ","
                 (rest, vararg) <- readParams
                 return $ (name:rest, vararg),
             return $ ([name], Nothing)]
@@ -882,10 +884,10 @@ gramTableExpr = do
 
     fieldIndexed :: TokParser s ([(Maybe ExprNode, ExprNode)], Maybe ExprNode)
     fieldIndexed = do
-        tokSymbol "["
+        _ <- tokSymbol "["
         key <- gramExpr
-        tokSymbol "]"
-        tokSymbol "="
+        _ <- tokSymbol "]"
+        _ <- tokSymbol "="
         value <- gramExpr
         (rest, mlast) <- readTableRest
         return $ ((Just key, value):rest, mlast)
@@ -893,11 +895,12 @@ gramTableExpr = do
     fieldNamed :: TokParser s ([(Maybe ExprNode, ExprNode)], Maybe ExprNode)
     fieldNamed = do
         try (lookAhead (do
-            tokIdent
-            tokSymbol "="))
+            _ <- tokIdent
+            _ <- tokSymbol "="
+            return ()))
         (pr, nameid) <- tokIdent
         let key = ExprNode (pr, ExprString nameid)
-        tokSymbol "="
+        _ <- tokSymbol "="
         value <- gramExpr
         (rest, mlast) <- readTableRest
         return $ ((Just key, value):rest, mlast)
@@ -917,7 +920,7 @@ gramTableExpr = do
     readTableRest = do
         choice [
             do
-                tokSymbol "," <|> tokSymbol ";"
+                _ <- tokSymbol "," <|> tokSymbol ";"
                 readFields,
             return $ ([], Nothing)]
 
@@ -940,7 +943,7 @@ gramSuffixExpr = do
         pra <- tokSymbol "("
         expr <- gramExpr
         prb <- tokSymbol ")"
-        return $ expr
+        return $ ExprNode (pra <> prb, ExprGroup expr)
 
     suffixes :: ExprNode -> TokParser s ExprNode
     suffixes base = do
@@ -953,21 +956,21 @@ gramSuffixExpr = do
 
     suffixExprIndex :: ExprNode -> TokParser s ExprNode
     suffixExprIndex base@(ExprNode (pra, _)) = do
-        tokSymbol "["
+        _ <- tokSymbol "["
         index <- gramExpr
         prb <- tokSymbol "]"
         suffixes $ ExprNode (pra <> prb, ExprIndex base index)
 
     suffixNameIndex :: ExprNode -> TokParser s ExprNode
     suffixNameIndex base@(ExprNode (pra, _)) = do
-        tokSymbol "."
+        _ <- tokSymbol "."
         (prb, name) <- tokIdent
         let index = ExprNode (prb, ExprString name)
         suffixes $ ExprNode (pra <> prb, ExprIndex base index)
 
     suffixMethod :: ExprNode -> TokParser s ExprNode
     suffixMethod base@(ExprNode (pra, _)) = do
-        tokSymbol ":"
+        _ <- tokSymbol ":"
         (_, name) <- tokIdent
         (prb, args, mlast) <- arguments
         let nstr = name
@@ -990,15 +993,15 @@ gramSuffixExpr = do
 
     argListRest :: TokParser s ([ExprNode], Maybe ExprNode)
     argListRest = do
-        head <- gramExpr
+        thead <- gramExpr
         choice [
             do
-                tokSymbol ","
-                (tail, mlast) <- argListRest
-                return $ ((head:tail), mlast),
-            if isMultretExpr head
-                then return $ ([], Just head)
-                else return $ ([head], Nothing)]
+                _ <- tokSymbol ","
+                (ttail, mlast) <- argListRest
+                return $ ((thead:ttail), mlast),
+            if isMultretExpr thead
+                then return $ ([], Just thead)
+                else return $ ([thead], Nothing)]
 
     argString :: TokParser s (SourceRange, [ExprNode], Maybe ExprNode)
     argString = do

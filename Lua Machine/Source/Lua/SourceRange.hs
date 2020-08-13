@@ -1,6 +1,6 @@
 module Lua.SourceRange (
     SourceName,
-    SourceRange,
+    SourceRange(..),
     collapseRangeLeft,
     collapseRangeNull,
     collapseRangeRight,
@@ -54,25 +54,25 @@ collapseRangeNull (SourceRange (fname, _))
     = SourceRange (fname, Nothing)
 
 collapseRangeLeft :: SourceRange -> SourceRange
-collapseRangeLeft (SourceRange (fname, Just (srow, scol, erow, ecol)))
+collapseRangeLeft (SourceRange (fname, Just (srow, scol, _, _)))
     = SourceRange (fname, Just (srow, scol, srow, scol))
 collapseRangeLeft (SourceRange (fname, Nothing))
     = SourceRange (fname, Nothing)
 
 collapseRangeRight :: SourceRange -> SourceRange
-collapseRangeRight (SourceRange (fname, Just (srow, scol, erow, ecol)))
+collapseRangeRight (SourceRange (fname, Just (_, _, erow, ecol)))
     = SourceRange (fname, Just (erow, ecol, erow, ecol))
 collapseRangeRight (SourceRange (fname, Nothing))
     = SourceRange (fname, Nothing)
 
 rangeLeft :: SourceRange -> SourcePos
-rangeLeft (SourceRange (fname, Just (srow, scol, erow, ecol)))
+rangeLeft (SourceRange (fname, Just (srow, scol, _, _)))
     = newPos fname srow scol
 rangeLeft (SourceRange (fname, Nothing))
     = initialPos fname
 
 rangeRight :: SourceRange -> SourcePos
-rangeRight (SourceRange (fname, Just (srow, scol, erow, ecol)))
+rangeRight (SourceRange (fname, Just (_, _, erow, ecol)))
     = newPos fname erow ecol
 rangeRight (SourceRange (fname, Nothing))
     = initialPos fname

@@ -1,12 +1,23 @@
+{-# LANGUAGE BangPatterns #-}
+{-# LANGUAGE OverloadedStrings #-}
+
+
 module Lua.Debug (
+    LuaFrameReturn,
+    LuaStackFrame(..),
+    SourceRange,
+    luadGetDebugHook,
+    luadGetStack,
     luadGetTraceback,
+    luadRunFunction,
+    luadSetDebugHook,
     luadSetLocation,
-    luadWithinFunction,
     luadWithinLocal,
 ) where
 
 
 import Control.Monad
+import Data.Maybe
 import qualified Data.ByteString.Char8 as BSt
 import Lua.Core
 import Lua.SourceRange
@@ -23,12 +34,16 @@ luadGetTraceback = do
         return $ (fname, loc))
 
 
+luadGetStack :: LuaState q s [LuaStackFrame q s]
+luadGetStack = lxAskStack
+
+
 luadModifyStackTop
     :: (LuaStackFrame q s -> LuaStackFrame q s)
     -> [LuaStackFrame q s]
     -> [LuaStackFrame q s]
 luadModifyStackTop func (frame:fs) = func frame:fs
-luadModifyStackTop func [] = []
+luadModifyStackTop _ [] = []
 
 
 luadSetLocation
@@ -41,6 +56,12 @@ luadSetLocation mpr = do
             let locationRef = lsfCurrentLocation frame
             lxWrite locationRef mpr
         _ -> return ()
+    (hookf, _, _, lineflag) <- lxGetDebugHook
+    when lineflag (do
+        let mline = do
+            SourceRange (_, Just (srow, _, _, _)) <- mpr
+            Just $ LInteger $ toInteger srow
+        () <$ lxCall hookf [LString "line", fromMaybe LNil mline])
 
 
 luadWithinLocal
@@ -55,19 +76,44 @@ luadWithinLocal mdef slot act = do
         act
 
 
-luadWithinFunction
+type LuaFrameReturn q s =
+    Either (LuaFunction q s, [LuaValue q s]) [LuaValue q s]
+
+
+luadRunFunction
     :: Maybe (SourceRange, BSt.ByteString)
     -> LuaVariableList q s
     -> LuaVariableList q s
-    -> LuaState q s t
-    -> LuaState q s t
-luadWithinFunction mdef upvalues args act = do
-    locationRef <- lxAlloc Nothing
+    -> LuaState q s (LuaFrameReturn q s)
+    -> LuaState q s [LuaValue q s]
+luadRunFunction mdef upvalues args act = do
+    locationRef <- lxAlloc $ fst <$> mdef
     let lstackFrame = LuaStackFrame {
         lsfDefinition = mdef,
         lsfCurrentLocation = locationRef,
         lsfUpvalues = upvalues,
         lsfLocals = args}
-    lxLocalStack
-        (lstackFrame:)
-        act
+    result <- lxLocalStack (lstackFrame:) (do
+        (callhookf, callflag, _, _) <- lxGetDebugHook
+        when callflag (do
+            () <$ lxCall callhookf [LString "call"])
+        result' <- act
+        (rethookf, _, retflag, _) <- lxGetDebugHook
+        when retflag (do
+            () <$ lxCall rethookf [
+                LString $ either (const "tail call") (const "return") result'])
+        return $ result')
+    case result of
+        Left (tailfunc, args') -> tailfunc args'
+        Right rets -> return rets
+
+
+luadGetDebugHook
+    :: LuaState q s (LuaValue q s, Bool, Bool, Bool)
+luadGetDebugHook = lxGetDebugHook
+
+
+luadSetDebugHook
+    :: (LuaValue q s, Bool, Bool, Bool)
+    -> LuaState q s ()
+luadSetDebugHook = lxSetDebugHook

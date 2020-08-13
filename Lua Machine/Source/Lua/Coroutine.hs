@@ -14,9 +14,9 @@ import Control.Monad.Trans
 
 
 data CoroutineT a b e m t
-    = Pure t
-    | Error e
-    | Hold b (a -> CoroutineT a b e m t)
+    = Pure !t
+    | Error !e
+    | Hold !b (a -> CoroutineT a b e m t)
     | Lift (m (CoroutineT a b e m t))
 
 
@@ -42,21 +42,21 @@ instance MonadTrans (CoroutineT a b e) where
 instance (Monad m) => Monad (CoroutineT a b e m) where
     return x = Pure x
     Pure x >>= sel = sel x
-    Error e >>= sel = Error e
+    Error e >>= _ = Error e
     Hold y g >>= sel = Hold y ((>>= sel) . g)
     Lift d >>= sel = Lift (d >>= (return . (>>= sel)))
 
 
 instance (Monad m) => Functor (CoroutineT a b e m) where
     fmap f (Pure x) = Pure (f x)
-    fmap f (Error e) = Error e
+    fmap _ (Error e) = Error e
     fmap f (Hold y g) = Hold y (fmap f . g)
     fmap f (Lift d) = Lift (fmap (fmap f) d)
 
 
 instance (Monad m) => Applicative (CoroutineT a b e m) where
     pure = return
-    x <*> y = x >>= (\f -> fmap f y)
+    (<*>) = ap
 
 
 instance (Monad m, Read e) => MonadFail (CoroutineT a b e m) where
