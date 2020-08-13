@@ -404,18 +404,7 @@ assert(a[1<2] == 20 and a[1>2] == 10)
 function f(a) return a end
 
 local a = {}
-do
-    local function x(i)
-        ::start::
-        if i >= -3000 then
-            print(i)
-            i = i-1
-            goto start
-        end
-    end
-    x(3000)
-end
-for i=3000,-3000,-1 do print(i) --[[a[i + 0.0] = i]] end
+for i=3000,-3000,-1 do a[i + 0.0] = i end
 a[10e30] = "alo"; a[true] = 10; a[false] = 20
 assert(a[10e30] == 'alo' and a[not 1] == 20 and a[10<20] == 10)
 for i=3000,-3000,-1 do assert(a[i] == i); end

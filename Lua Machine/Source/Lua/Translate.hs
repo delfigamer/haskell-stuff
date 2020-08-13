@@ -1,6 +1,7 @@
+{-# LANGUAGE DeriveGeneric, DeriveAnyClass #-}
+{-# LANGUAGE FlexibleContexts #-}
 {-# LANGUAGE FlexibleInstances #-}
 {-# LANGUAGE OverloadedStrings #-}
-{-# LANGUAGE FlexibleContexts #-}
 
 
 module Lua.Translate (
@@ -14,22 +15,24 @@ module Lua.Translate (
 ) where
 
 
-import Data.List (foldl')
-import Data.Maybe
-import qualified Data.ByteString.Char8 as BSt
-import qualified Data.ByteString.Lazy.Char8 as B
+import Control.DeepSeq
 import Control.Monad.Reader
 import Control.Monad.State.Strict
+import Data.List (foldl')
+import Data.Maybe
+import GHC.Generics (Generic)
+import qualified Data.ByteString.Char8 as BSt
+import qualified Data.ByteString.Lazy.Char8 as B
 import Lua.DefString
 import Lua.Parse
 import Lua.SourceRange
 
 
 data IrSlot
-    = ISLocal Int
-    | ISConst Int
-    | ISGuard Int
-    deriving (Eq)
+    = ISLocal !Int
+    | ISConst !Int
+    | ISGuard !Int
+    deriving (Show, Eq, Generic, NFData)
 
 
 instance DefString IrSlot where
@@ -86,6 +89,7 @@ data IrValue
         [(Int, Maybe (SourceRange, BSt.ByteString))] -- named arguments
         Int Int Int -- max count of locals|consts|guards
         IrBody -- function body
+    deriving (Show, Generic, NFData)
 
 
 data IrList
@@ -95,12 +99,14 @@ data IrList
     | IARange IrValue IrValue IrValue
     | IAEmpty
     | IACons IrValue IrList
+    deriving (Show, Generic, NFData)
 
 
 data IrSink
     = IASetLocal Int
     | IASetUpvalue Int
     | IASetIndex IrValue IrValue
+    deriving (Show, Generic, NFData)
 
 
 data IrAction
@@ -114,6 +120,7 @@ data IrAction
     | IABranch IrValue IrAction IrAction
     | IABlock Int
     | IAMark SourceRange IrAction
+    deriving (Show, Generic, NFData)
 
 
 type IrBody = [(Int, IrAction)]
@@ -1245,7 +1252,7 @@ compileFunction pr name (ExprNode (_,
     let upconstdecls = reverse $ map
             (\(name', pr', _, source) -> (source, Just (pr', name')))
             (lecxUpconsts context)
-    return $ IAFunction
+    return $!! IAFunction
         (Just (pr, name))
         upvaluedecls
         upconstdecls
@@ -1275,7 +1282,7 @@ compileChunk filename stats = do
     cbody <- runReaderT pbody ((lecxBlocks context), Nothing)
     let (main, bbs) = cbody (IAReturn IAEmpty) []
     let (maxl, maxc, maxg) = lecxMaxIndex context
-    return $ (maxl, maxc, maxg, (0, main):bbs)
+    return $!! (maxl, maxc, maxg, (0, main):bbs)
 
 
 translateLua

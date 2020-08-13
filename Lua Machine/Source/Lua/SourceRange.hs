@@ -1,3 +1,6 @@
+{-# LANGUAGE DeriveGeneric, DeriveAnyClass #-}
+
+
 module Lua.SourceRange (
     SourceName,
     SourceRange(..),
@@ -10,11 +13,14 @@ module Lua.SourceRange (
     rangeRight,
 ) where
 
-import Text.Parsec.Pos
+import Control.DeepSeq
+import GHC.Generics (Generic)
 import Data.Semigroup (stimes, stimesIdempotent)
+import Text.Parsec.Pos
 
 newtype SourceRange
     = SourceRange (SourceName, Maybe (Line, Column, Line, Column))
+    deriving (Generic, NFData)
 
 instance Show SourceRange where
     show (SourceRange (fname, Just (srow, scol, erow, ecol)))

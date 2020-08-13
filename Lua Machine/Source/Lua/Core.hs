@@ -989,13 +989,14 @@ lxAllocTable
     :: [(LuaValue q s, LuaValue q s)]
     -> LuaState q s (LuaTable q s)
 lxAllocTable elems = do
-    body <- lxLiftST $ do
-        body' <- T.new
+    body <- do
+        body' <- lxLiftST $ T.new
         flip fix elems $ \loop elems1 -> do
             case elems1 of
+                (LNil, _):_ -> lxError $ errNilIndex
                 (_, LNil):rest -> loop rest
                 (!kval, !vval):rest -> do
-                    T.set body' (lxKey kval) (kval, vval)
+                    lxLiftST $ T.set body' (lxKey kval) (kval, vval)
                     loop rest
                 [] -> return ()
         return $ body'

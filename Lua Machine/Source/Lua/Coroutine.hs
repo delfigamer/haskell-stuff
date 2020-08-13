@@ -16,8 +16,8 @@ import Control.Monad.Trans
 data CoroutineT a b e m t
     = Pure !t
     | Error !e
-    | Hold !b (a -> CoroutineT a b e m t)
-    | Lift (m (CoroutineT a b e m t))
+    | Hold !b !(a -> CoroutineT a b e m t)
+    | Lift !(m (CoroutineT a b e m t))
 
 
 raise :: e -> CoroutineT a b e m t
