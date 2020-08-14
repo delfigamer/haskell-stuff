@@ -261,12 +261,11 @@ data Statement
         [StatNode] -- body
     | StatForEach [NameNode] [ExprNode] (Maybe ExprNode) [StatNode]
     | StatFunction ExprNode ExprNode
-    | StatLocalFunction NameNode ExprNode [StatNode]
+    | StatLocalFunction NameNode ExprNode
     | StatLocalDef
         [(NameNode, Maybe BSt.ByteString)]
         [ExprNode]
         (Maybe ExprNode)
-        [StatNode]
     | StatReturn [ExprNode] (Maybe ExprNode)
     deriving (Show)
 
@@ -344,32 +343,22 @@ instance DefString StatNode where
     defString d (StatNode (_, StatFunction lhs fvalue)) rest
         = "function " $ defString d lhs
             $ defFunctionHeadless d fvalue $ ";" $ rest
-    defString d (StatNode (_, StatLocalFunction name fvalue body)) rest
+    defString d (StatNode (_, StatLocalFunction name fvalue)) rest
         = "local function " $ defString d name
-            $ defFunctionHeadless d fvalue $ ";"
-            $ defString d body $ defBr d
-            $ "--[[unlocal " $ defString d name $ "]]" $ rest
-    defString d (StatNode (_, StatLocalDef nameattrs [] Nothing body)) rest
-        = "local " $ defNameAttrs d nameattrs $ ";"
-            $ defString d body $ defBr d
-            $ "--[[unlocal " $ defNameAttrs d nameattrs $ "]]" $ rest
+            $ defFunctionHeadless d fvalue $ ";" $ rest
+    defString d (StatNode (_, StatLocalDef nameattrs [] Nothing)) rest
+        = "local " $ defNameAttrs d nameattrs $ ";" $ rest
     defString d (StatNode (_,
-            StatLocalDef nameattrs [] (Just elast) body)) rest
+            StatLocalDef nameattrs [] (Just elast))) rest
         = "local " $ defNameAttrs d nameattrs $ " = "
-            $ defString d elast $ " --[[multret]];"
-            $ defString d body $ defBr d
-            $ "--[[unlocal " $ defNameAttrs d nameattrs $ "]]" $ rest
-    defString d (StatNode (_, StatLocalDef nameattrs rhs Nothing body)) rest
+            $ defString d elast $ " --[[multret]];" $ rest
+    defString d (StatNode (_, StatLocalDef nameattrs rhs Nothing)) rest
         = "local " $ defNameAttrs d nameattrs $ " = "
-            $ defList ", " d rhs $ ";"
-            $ defString d body $ defBr d
-            $ "--[[unlocal " $ defNameAttrs d nameattrs $ "]]" $ rest
+            $ defList ", " d rhs $ ";" $ rest
     defString d (StatNode (_,
-            StatLocalDef nameattrs rhs (Just elast) body)) rest
+            StatLocalDef nameattrs rhs (Just elast))) rest
         = "local " $ defNameAttrs d nameattrs $ " = "
-            $ defList ", " d (rhs ++ [elast]) $ " --[[multret]];"
-            $ defString d body $ defBr d
-            $ "--[[unlocal " $ defNameAttrs d nameattrs $ "]]" $ rest
+            $ defList ", " d (rhs ++ [elast]) $ " --[[multret]];" $ rest
     defString _ (StatNode (_, StatReturn [] Nothing)) rest
         = "return;" $ rest
     defString d (StatNode (_, StatReturn [] (Just elast))) rest
@@ -409,10 +398,6 @@ gramBlock = do
         do
             _ <- tokSymbol ";"
             gramBlock,
-        do
-            stat <- gramScopingStat
-            rest <- gramBlock
-            return $ [stat rest],
         do
             stat <- gramSingleStat
             rest <- gramBlock
@@ -464,11 +449,9 @@ gramSingleStat = do
         gramIfStat,
         gramForStat,
         gramFunctionStat,
+        gramLocalFunctionStat,
+        gramLocalStat,
         gramExprStat]
-
-
-gramScopingStat :: TokParser s ([StatNode] -> StatNode)
-gramScopingStat = gramLocalFunctionStat <|> gramLocalStat
 
 
 gramIfStat :: TokParser s StatNode
@@ -587,18 +570,17 @@ gramFunctionStat = do
         return $ (ExprNode (pra <> prb, ExprIndex base index), True)
 
 
-gramLocalFunctionStat :: TokParser s ([StatNode] -> StatNode)
+gramLocalFunctionStat :: TokParser s StatNode
 gramLocalFunctionStat = do
     _ <- try (lookAhead (tokKeyword "local" >> tokKeyword "function"))
     pra <- tokKeyword "local"
     _ <- tokKeyword "function"
     name <- gramName
     func@(ExprNode (prb, _)) <- gramFunctionBody
-    return $ (\body ->
-        StatNode (pra <> prb, StatLocalFunction name func body))
+    return $ StatNode (pra <> prb, StatLocalFunction name func)
 
 
-gramLocalStat :: TokParser s ([StatNode] -> StatNode)
+gramLocalStat :: TokParser s StatNode
 gramLocalStat = do
     pra <- tokKeyword "local"
     nameattrs <- readNameattrs
@@ -626,19 +608,17 @@ gramLocalStat = do
 
     localInit
         :: SourceRange -> [(NameNode, Maybe BSt.ByteString)]
-        -> TokParser s ([StatNode] -> StatNode)
+        -> TokParser s StatNode
     localInit pra nameattrs = do
         _ <- tokSymbol "="
         (prb, rhs, mlast) <- gramExprList
-        return $ (\body ->
-            StatNode (pra <> prb, StatLocalDef nameattrs rhs mlast body))
+        return $ StatNode (pra <> prb, StatLocalDef nameattrs rhs mlast)
 
     localPure
         :: SourceRange -> [(NameNode, Maybe BSt.ByteString)]
-        -> TokParser s ([StatNode] -> StatNode)
+        -> TokParser s StatNode
     localPure pra nameattrs = do
-        return $ (\body ->
-            StatNode (pra, StatLocalDef nameattrs [] Nothing body))
+        return $ StatNode (pra, StatLocalDef nameattrs [] Nothing)
 
 
 gramExprStat :: TokParser s StatNode

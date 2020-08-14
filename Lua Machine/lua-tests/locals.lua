@@ -59,7 +59,7 @@ function f (a)
 end
 
 local b=10
-local a; repeat local b; a,b=1,2; assert(a+1==b); until a+b==3
+local a; repeat local b; a,b=1,2; assert(a+1==b); until assert(a+b==3)
 
 
 assert(x == 1)
@@ -99,6 +99,7 @@ do
                                         assert(a==-2^%s)]], -j, p-j, i), '')) ()
     end
     p = 2 * p;  i = i + 1
+    print(p)
   until p <= 0
 end
 

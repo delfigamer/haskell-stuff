@@ -18,7 +18,7 @@ module Lua.Translate (
 import Control.DeepSeq
 import Control.Monad.Reader
 import Control.Monad.State.Strict
-import Data.List (foldl')
+import Data.List
 import Data.Maybe
 import GHC.Generics (Generic)
 import qualified Data.ByteString.Char8 as BSt
@@ -113,7 +113,7 @@ data IrAction
     = IAAssign IrList [IrSink] IrAction
     | IAOpen IrList [(Maybe (SourceRange, BSt.ByteString), IrSlot)] IrAction
     | IASequence IrList IrAction
-    | IADrop [IrSlot] IrAction
+    | IADrop IrSlot IrAction
     | IAReturn IrList
     | IATailCall IrValue IrList
     | IATailCallMethod IrValue IrValue IrList
@@ -299,8 +299,8 @@ instance DefString IrAction where
                 $ defTargets xs $ rest'
     defString d (IASequence sa sb) rest
         = defString d sa $ ";" $ defBr d $ defString d sb $ rest
-    defString d (IADrop slots x) rest
-        = "drop [" $ defList ", " d slots $ "];" $ defBr d
+    defString d (IADrop slot x) rest
+        = "drop " $ defString d slot $ ";" $ defBr d
             $ defString d x $ rest
     defString d (IAReturn x) rest
         = "return {" $ defString d x $ "}" $ rest
@@ -341,13 +341,26 @@ data LexicalContext = LexicalContext {
     lecxBlocks :: BlockTable}
 
 
-lecxSetSlots
+lecxSaveScope
     :: (Monad m)
-    => [(Int, BSt.ByteString, SourceRange, IrSlot)]
-    -> StateT LexicalContext m ()
-lecxSetSlots slots = do
-    modify' (\lecx -> lecx {
-        lecxSlots = slots})
+    => StateT LexicalContext m Int
+lecxSaveScope = do
+    slots <- lecxSlots <$> get
+    case slots of
+        [] -> return $ -1
+        (ix, _, _, _):_ -> return $ ix
+
+
+lecxRestoreScope
+    :: (Monad m)
+    => Int
+    -> StateT LexicalContext m [IrSlot]
+lecxRestoreScope limit = do
+    slots <- lecxSlots <$> get
+    let (dropped, left) = flip break slots $ \(ix, _, _, _) -> ix <= limit
+    modify' $ \lecx -> lecx {
+        lecxSlots = left}
+    return $ map (\(_, _, _, slot) -> slot) $ dropped
 
 
 lecxCreateSlot
@@ -413,7 +426,7 @@ lecxAccessVariable
     -> StateT LexicalContext Maybe (
         SourceRange,
         (IrSlot -> a) -> (Int -> a) -> (Int -> a) -> a)
-      -- onSlot           onUpvalue     onUpconst
+      {- onSlot           onUpvalue     onUpconst -}
 lecxAccessVariable name = do
     lecx <- get
     msum [
@@ -481,7 +494,7 @@ lecxCreateBlock mname = do
     let ix = case lecxBlocks lecx of
             (bix, _, _):_ -> bix+1
             _ -> 0
-    let locstack = reverse $ map (\(index,_,_,_) -> index) $ lecxSlots lecx
+    let locstack = map (\(myix,_,_,_) -> myix) $ lecxSlots lecx
     put $ lecx {
         lecxBlocks = (ix, mname, locstack):lecxBlocks lecx}
     return $ ix
@@ -498,14 +511,14 @@ lecxCreateBlock mname = do
 lecxNewBlock
     :: (Monad m) => StateT LexicalContext m Int
 lecxNewBlock = do
-    mapStateT (\(Just x) -> return x) $ lecxCreateBlock Nothing
+    mapStateT (return . fromJust) $ lecxCreateBlock Nothing
 
 
 lecxGetLocalStack
     :: (Monad m) => StateT LexicalContext m [(Int, IrSlot)]
 lecxGetLocalStack = do
     lecx <- get
-    return $ map (\(index, _, _, slot) -> (index, slot)) $ lecxSlots lecx
+    return $ map (\(ix, _, _, slot) -> (ix, slot)) $ lecxSlots lecx
 
 
 type Compile t = StateT LexicalContext (Either CompileError) t
@@ -729,294 +742,244 @@ compileExpressionList (t:targets) (x:xs) mfinal = do
 compileExpressionList [] _ _ = undefined
 
 
-type Link t = ReaderT (BlockTable, Maybe Int) (Either CompileError) t
+newtype Link = Link {
+    link
+        :: (BlockTable, Maybe Int)
+        -> (IrAction, IrBody)
+        -> Either CompileError (IrAction, IrBody)}
 
 
-type BodyS m a
-    =  IrAction
-    -> IrBody
-    -> (IrAction, IrBody)
+instance Semigroup Link where
+    Link fa <> Link fb = Link $ \ctx rest ->
+        fa ctx =<< fb ctx rest
 
 
-pfindBlock
-    :: Int
-    -> Link [Int]
-pfindBlock ixref = do
-    (blocks, _) <- ask
-    search blocks
-    where
-    search [] = error "this shouldn't happen"
-    search ((ix, _, stack):rest) = do
-        if ix == ixref
-            then return $ stack
-            else search rest
+instance Monoid Link where
+    mempty = Link $ \_ rest -> Right rest
 
 
-pfindBreak
-    :: SourceRange
-    -> Link (Int, [Int])
-pfindBreak pr = do
-    (_, mbreak) <- ask
+linkAction :: (IrAction -> IrAction) -> Link
+linkAction iras = Link $ \(_, _) (after, bbs) -> do
+    return $ (iras after, bbs)
+
+
+linkLast :: IrAction -> Link
+linkLast ira = Link $ \(_, _) (_, bbs) -> do
+    return $ (ira, bbs)
+
+
+linkBranch :: IrValue -> Link -> Link -> Link
+linkBranch condira ptbody pestat = Link (\ctx (after, bbs) -> do
+    (estatira, estatbbs) <- link pestat ctx (after, bbs)
+    (tbodyira, tbodybbs) <- link ptbody ctx (after, estatbbs)
+    return $ (IABranch condira tbodyira estatira, tbodybbs))
+
+
+linkSplit :: Int -> Link
+linkSplit ix = Link $ \(_, _) (after, bbs) -> do
+    return $ (IABlock ix, (ix, after):bbs)
+
+
+linkLocalBreak :: Int -> Link -> Link
+linkLocalBreak bix body = Link $ \(blocks, _) (after, bbs) -> do
+    link body (blocks, Just bix) (after, bbs)
+
+
+linkBreak :: SourceRange -> [(Int, IrSlot)] -> Link
+linkBreak pr fromstack = Link $ \(blocks, mbreak) (_, bbs) -> do
     case mbreak of
-        Just breakid -> do
-            stack <- pfindBlock breakid
-            return $ (breakid, stack)
-        Nothing -> lift $ Left $ CompileError pr "Invalid break"
+        Nothing -> Left $ CompileError pr "Invalid break"
+        Just bix -> do
+            let tostack = lookupBlockByIx bix blocks
+            diff <- stackDifference pr fromstack tostack
+            return $ (makeDropBefore diff $ IABlock bix, bbs)
 
 
-pfindLabel
-    :: SourceRange
-    -> BSt.ByteString
-    -> Link (Int, [Int])
-pfindLabel pr nameref = do
-    (blocks, _) <- ask
-    search blocks
-    where
-    search [] = lift $ Left $
-        CompileError pr ("Invalid label " $ unpackSt nameref $ "")
-    search ((_, Nothing, _):rest) = search rest
-    search ((ix, Just name, stack):rest) = do
-        if name == nameref
-            then return $ (ix, stack)
-            else search rest
+linkGoto :: SourceRange -> BSt.ByteString -> [(Int, IrSlot)] -> Link
+linkGoto pr name fromstack = Link $ \(blocks, _) (_, bbs) -> do
+    case lookupBlockByName name blocks of
+        Nothing -> Left $ CompileError pr $
+            "Invalid label " $ unpackSt name $ ""
+        Just (bix, tostack) -> do
+            diff <- stackDifference pr fromstack tostack
+            return $ (makeDropBefore diff $ IABlock bix, bbs)
 
 
-pstackDiff
+lookupBlockByIx :: Int -> BlockTable -> [Int]
+lookupBlockByIx bix ((ix, _, stack):rest)
+    | bix == ix = stack
+    | otherwise = lookupBlockByIx bix rest
+lookupBlockByIx _ [] = undefined
+
+
+lookupBlockByName :: BSt.ByteString -> BlockTable -> Maybe (Int, [Int])
+lookupBlockByName nameref ((_, Nothing, _):rest) = do
+    lookupBlockByName nameref rest
+lookupBlockByName nameref ((ix, Just name, stack):rest)
+    | nameref == name = Just (ix, stack)
+    | otherwise = lookupBlockByName nameref rest
+lookupBlockByName _ [] = Nothing
+
+
+stackDifference
     :: SourceRange
     -> [(Int, IrSlot)]
     -> [Int]
-    -> Link [IrSlot]
-pstackDiff pr from to = do
-    case to of
-        tindex:trest -> do
-            case from of
-                (findex, _):frest -> do
-                    if tindex == findex
-                        then pstackDiff pr frest trest
-                        else err
-                [] -> err
-        [] -> return $ reverse $ map snd $ from
-    where
-    err = do
-        lift $ Left $
-            CompileError pr "Jump lands inside a variable's scope"
-
-
-plocalBreak
-    :: Int
-    -> Link a
-    -> Link a
-plocalBreak breakid link = local (\(blocks, _) -> (blocks, Just breakid)) link
+    -> Either CompileError [IrSlot]
+stackDifference pr from to = do
+    case (from, to) of
+        ([], []) -> do
+            return $! []
+        ((_, fslot):frest, []) -> do
+            (fslot:) <$!> stackDifference pr frest to
+        ((findex, fslot):frest, tindex:_)
+            | findex == tindex -> do
+                return $! []
+            | findex > tindex -> do
+                (fslot:) <$!> stackDifference pr frest to
+        _ -> Left $ CompileError pr "Jump lands inside a variable's scope"
 
 
 makeDropBefore
     :: [IrSlot]
     -> IrAction
     -> IrAction
-makeDropBefore slots (IADrop slots' after)
-    = IADrop (slots ++ slots') after
-makeDropBefore slots after
-    = IADrop slots after
+makeDropBefore [] after
+    = after
+makeDropBefore (slot:rest) after
+    = IADrop slot $ makeDropBefore rest after
 
 
-compileBody
-    :: [StatNode]
-    -> Link (BodyS m a)
-    -> StateT LexicalContext (Either CompileError) (Link (BodyS m a))
+compileStat
+    :: StatNode
+    -> StateT LexicalContext (Either CompileError) Link
 
-compileBody [] prev = do
-    return $ prev
+compileStat (StatNode (_, StatNull)) = do
+    return $ mempty
 
-compileBody (StatNode (_, StatNull):others) prev = do
-    compileBody others prev
-
-compileBody (StatNode (pr, StatAssign lhs rhs mlast):others) prev = do
+compileStat (StatNode (pr, StatAssign lhs rhs mlast)) = do
     let targets = map (defString 0) lhs ++ repeat id
     sourceira <- compileExpressionList targets rhs mlast
     sinks <- forM lhs compileExpressionWrite
-    compileBody others (do
-        cprev <- prev
-        return (\after bbs -> do
-            cprev
-                (IAMark pr
-                    (IAAssign
-                        sourceira
-                        sinks
-                        after))
-                bbs))
+    return $ linkAction $
+        IAMark pr . IAAssign sourceira sinks
 
-compileBody (StatNode (pr, StatInvoke expr):others) prev = do
+compileStat (StatNode (pr, StatInvoke expr)) = do
     case expr of
         ExprNode (_, ExprCall _ _ _) -> return ()
         ExprNode (_, ExprMethodCall _ _ _ _) -> return ()
         _ -> lift $ Left $
             CompileError pr "Function call expected"
     exprira <- compileExpressionReadLast "(invoke)" expr
-    compileBody others (do
-        cprev <- prev
-        return (\after bbs -> do
-            cprev
-                (IAMark pr
-                    (IASequence
-                        exprira
-                        after))
-                bbs))
+    return $ linkAction $
+        IAMark pr . IASequence exprira
 
-compileBody (StatNode (pr, StatLabel label):others) prev = do
+compileStat (StatNode (pr, StatLabel label)) = do
     let (NameNode (_, name)) = label
     nextid <- mapStateT (maybe (err name) Right) $
         lecxCreateBlock (Just name)
-    compileBody others (do
-        cprev <- prev
-        return (\after bbs -> do
-            let nextbb = (nextid, IAMark pr after)
-            cprev
-                (IABlock nextid)
-                (nextbb:bbs)))
+    return $ linkSplit nextid <> linkAction (IAMark pr)
     where
     err name = Left $ CompileError pr ("Duplicate label " $ unpackSt name $ "")
 
-compileBody (StatNode (pr, StatBreak):others) prev = do
+compileStat (StatNode (pr, StatBreak)) = do
     currentstack <- lecxGetLocalStack
-    compileBody others (do
-        cprev <- prev
-        (breakid, targetstack) <- pfindBreak pr
-        stackdiff <- pstackDiff pr (reverse currentstack) targetstack
-        return (\_ bbs -> do
-            case stackdiff of
-                [] -> cprev
-                    (IAMark pr $
-                        IABlock breakid)
-                    bbs
-                _ -> cprev
-                    (IAMark pr $
-                        IADrop stackdiff (IABlock breakid))
-                    bbs))
+    return $ linkAction (IAMark pr) <> linkBreak pr currentstack
 
-compileBody (StatNode (pr, StatGoto label):others) prev = do
-    let (NameNode (_, name)) = label
+compileStat (StatNode (pr, StatGoto label)) = do
+    let NameNode (_, name) = label
     currentstack <- lecxGetLocalStack
-    compileBody others (do
-        cprev <- prev
-        (targetid, targetstack) <- pfindLabel pr name
-        stackdiff <- pstackDiff pr (reverse currentstack) targetstack
-        return (\_ bbs -> do
-            case stackdiff of
-                [] -> cprev
-                    (IAMark pr $
-                        IABlock targetid)
-                    bbs
-                _ -> cprev
-                    (IAMark pr $
-                        IADrop stackdiff (IABlock targetid))
-                    bbs))
+    return $ linkAction (IAMark pr) <> linkGoto pr name currentstack
 
-compileBody (StatNode (_, StatDo body):others) prev = do
-    pbody <- compileBody body prev
-    compileBody others pbody
+compileStat (StatNode (_, StatDo body)) = do
+    scope <- lecxSaveScope
+    pbody <- compileBody body
+    diff <- lecxRestoreScope scope
+    return $ pbody <> linkAction (makeDropBefore diff)
 
-compileBody (StatNode (_, StatWhile cond body):others) prev = do
+compileStat (StatNode (_, StatWhile cond body)) = do
     let (ExprNode (condpr, _)) = cond
     loopid <- lecxNewBlock
     condira <- compileExpressionRead "(while condition)" cond
-    pbody <- compileBody body (return (,))
+    scope <- lecxSaveScope
+    pbody <- compileBody body
+    diff <- lecxRestoreScope scope
     nextid <- lecxNewBlock
-    compileBody others (do
-        cprev <- prev
-        cbody <- plocalBreak nextid pbody
-        return (\after bbs -> do
-            let nextbb = (nextid, after)
-            let (bodyira, bodybbs) = cbody (IABlock loopid) (nextbb:bbs)
-            let loopira = IABranch condira bodyira (IABlock nextid)
-            let loopbb = (loopid, IAMark condpr loopira)
-            cprev (IABlock loopid) (loopbb:bodybbs)))
+    return $ mconcat [
+        linkSplit loopid,
+        linkAction $ IAMark condpr,
+        linkBranch condira
+            (linkLocalBreak nextid $
+                pbody <> (linkLast $ makeDropBefore diff $ IABlock loopid))
+            mempty,
+        linkSplit nextid]
 
-compileBody (StatNode (_, StatRepeat body cond):others) prev = do
+compileStat (StatNode (_, StatRepeat body cond)) = do
     let (ExprNode (condpr, _)) = cond
     loopid <- lecxNewBlock
-    pbody <- compileBody body (return (,))
-    condira <- compileExpressionRead "(repeat condifion)" cond
+    scope <- lecxSaveScope
+    pbody <- compileBody body
+    condira <- compileExpressionRead "(repeat condition)" cond
+    diff <- lecxRestoreScope scope
     nextid <- lecxNewBlock
-    compileBody others (do
-        cprev <- prev
-        cbody <- plocalBreak nextid pbody
-        return (\after bbs -> do
-            let nextbb = (nextid, after)
-            let checkira = IABranch condira (IABlock nextid) (IABlock loopid)
-            let (bodyira, bodybbs) = cbody
-                    (IAMark condpr checkira) (nextbb:bbs)
-            let loopbb = (loopid, bodyira)
-            cprev (IABlock loopid) (loopbb:bodybbs)))
+    return $ mconcat [
+        linkSplit loopid,
+        linkLocalBreak nextid $
+            pbody
+                <> linkAction (IAMark condpr)
+                <> linkBranch condira
+                    (linkAction $ makeDropBefore diff)
+                    (linkLast $ makeDropBefore diff $ IABlock loopid),
+        linkSplit nextid]
 
-compileBody (StatNode (pr, StatIf cond tbody estat):others) prev = do
+compileStat (StatNode (pr, StatIf cond tbody estat)) = do
     condira <- compileExpressionRead "(if condition)" cond
-    ptbody <- compileBody tbody (return (,))
-    pestat <- compileBody [estat] (return (,))
+    scope <- lecxSaveScope
+    ptbody <- compileBody tbody
+    diff <- lecxRestoreScope scope
+    pestat <- compileStat estat
     nextid <- lecxNewBlock
-    compileBody others (do
-        cprev <- prev
-        ctbody <- ptbody
-        cestat <- pestat
-        return (\after bbs -> do
-            let nextbb = (nextid, after)
-            let mergeira = IABlock nextid
-            let (estatira, estatbbs) = cestat mergeira (nextbb:bbs)
-            let (tbodyira, tbodybbs) = ctbody mergeira estatbbs
-            let branchira = IABranch condira tbodyira estatira
-            cprev
-                (IAMark pr branchira)
-                tbodybbs))
+    return $ mconcat [
+        linkAction $ IAMark pr,
+        linkBranch condira
+            (ptbody <> (linkAction $ makeDropBefore diff))
+            pestat,
+        linkSplit nextid]
 
-compileBody (StatNode (pr,
-        StatForNum param start limit mdelta body):others) prev = do
+compileStat (StatNode (pr, StatForNum param start limit mdelta body)) = do
     let (NameNode (parampr, paramname)) = param
     startira <- compileExpressionRead "(range start)" start
     limitira <- compileExpressionRead "(range limit)" limit
     deltaira <- case mdelta of
             Just delta -> compileExpressionRead "(range delta)" delta
             Nothing -> return $ IAInteger 1
-    oldscope <- lecxSlots <$> get
+    scopeouter <- lecxSaveScope
     fiterid <- lecxCreateConst "(range iterator)" pr
     paramid <- lecxCreateLocal paramname parampr
+    scopeinner <- lecxSaveScope
     loopid <- lecxNewBlock
-    pbody <- compileBody body (return (,))
-    lecxSetSlots oldscope
+    pbody <- compileBody body
+    diffinner <- lecxRestoreScope scopeinner
+    diffouter <- lecxRestoreScope scopeouter
     nextid <- lecxNewBlock
-    compileBody others (do
-        cprev <- prev
-        cbody <- plocalBreak nextid pbody
-        return (\after bbs -> do
-            let (bodyira, bodybbs) = cbody
-                    (IABlock loopid)
-                    ((nextid, after):bbs)
-            let exitira = IADrop
-                    [
-                        ISLocal paramid,
-                        ISConst fiterid]
-                    (IABlock nextid)
-            let branchira = IABranch
-                    (IASlot (ISLocal paramid))
-                    bodyira
-                    exitira
-            let stepira = IAAssign
-                    (IACall
-                        (IASlot (ISConst fiterid))
-                        IAEmpty)
-                    [IASetLocal paramid]
-                    branchira
-            let loopira = IABlock loopid
-            let loopbbs = (loopid, IAMark parampr stepira):bodybbs
-            let initira = IAOpen
-                    (IARange startira limitira deltaira)
-                    [
-                        (Just (pr, "(range iterator)"), ISConst fiterid),
-                        (Just (parampr, paramname), ISLocal paramid)]
-                    loopira
-            cprev
-                (IAMark pr initira)
-                loopbbs))
+    return $ mconcat [
+        linkAction $ IAMark pr . IAOpen
+            (IARange startira limitira deltaira)
+            [
+                (Just (pr, "(range iterator)"), ISConst fiterid),
+                (Just (parampr, paramname), ISLocal paramid)],
+        linkSplit loopid,
+        linkAction $ IAMark parampr . IAAssign
+            (IACall (IASlot $ ISConst fiterid) IAEmpty)
+            [IASetLocal paramid],
+        linkBranch (IASlot $ ISLocal paramid)
+            (linkLocalBreak nextid $
+                pbody <> (linkLast $
+                    makeDropBefore diffinner $ IABlock loopid))
+            (linkAction $ makeDropBefore diffouter),
+        linkSplit nextid]
 
-compileBody (StatNode (pr, StatForEach lhs rhs mlast body):others) prev = do
+compileStat (StatNode (pr, StatForEach lhs rhs mlast body)) = do
     let lhspr = foldl' (<>) (collapseRangeNull pr) $
             map (\(NameNode (pr', _)) -> pr') lhs
     initlistira <- compileExpressionList
@@ -1026,7 +989,7 @@ compileBody (StatNode (pr, StatForEach lhs rhs mlast body):others) prev = do
             "(for index)",
             "(for guard)"] ++ repeat id)
         rhs mlast
-    oldscope <- lecxSlots <$> get
+    scopeouter <- lecxSaveScope
     fiterid <- lecxCreateConst "(for iterator)" pr
     fstateid <- lecxCreateConst "(for context)" pr
     findexid <- lecxCreateLocal "(for index)" pr
@@ -1036,123 +999,68 @@ compileBody (StatNode (pr, StatForEach lhs rhs mlast body):others) prev = do
         return $ (Just (pr', name), lix))
     let (_, firstlocalid):_ = locals
     loopid <- lecxNewBlock
-    pbody <- compileBody body (return (,))
-    lecxSetSlots oldscope
+    scopeinner <- lecxSaveScope
+    pbody <- compileBody body
+    diffinner <- lecxRestoreScope scopeinner
+    diffouter <- lecxRestoreScope scopeouter
     nextid <- lecxNewBlock
-    compileBody others (do
-        cprev <- prev
-        cbody <- plocalBreak nextid pbody
-        return (\after bbs -> do
-            let (bodyira, bodybbs) = cbody
-                    (IABlock loopid)
-                    ((nextid, after):bbs)
-            let droplist = reverse $ (map (ISLocal . snd) locals)
-            let exitira = IADrop
-                    (droplist ++ [
-                        ISGuard fguardid,
-                        ISLocal findexid,
-                        ISConst fstateid,
-                        ISConst fiterid])
-                    (IABlock nextid)
-            let branchira = IABranch
-                    (IASlot (ISLocal findexid))
-                    bodyira
-                    exitira
-            let stepira = IAAssign
-                    (IACall
-                        (IASlot (ISConst fiterid))
-                        (IACons
-                            (IASlot (ISConst fstateid))
-                            (IACons
-                                (IASlot (ISLocal findexid))
-                                IAEmpty)))
-                    (map (IASetLocal . snd) locals)
-                    (IAAssign
-                        (IACons (IASlot (ISLocal firstlocalid)) IAEmpty)
-                        [IASetLocal findexid]
-                        branchira)
-            let loopira = IABlock loopid
-            let loopbbs = (loopid, IAMark lhspr stepira):bodybbs
-            let initira = IAOpen
-                    initlistira
-                    [
-                        (Just (pr, "(for iterator)"), ISConst fiterid),
-                        (Just (pr, "(for context)"), ISConst fstateid),
-                        (Just (pr, "(for index)"), ISLocal findexid),
-                        (Just (pr, "(for guard)"), ISGuard fguardid)]
-                    (IAOpen
-                        IAEmpty
-                        (map (\(def, lid) -> (def, ISLocal lid)) locals)
-                        loopira)
-            cprev
-                (IAMark pr initira)
-                loopbbs))
+    return $ mconcat [
+        linkAction $ IAMark pr . IAOpen
+            initlistira
+            [
+                (Just (pr, "(for iterator)"), ISConst fiterid),
+                (Just (pr, "(for context)"), ISConst fstateid),
+                (Just (pr, "(for index)"), ISLocal findexid),
+                (Just (pr, "(for guard)"), ISGuard fguardid)],
+        linkAction $ IAOpen
+            IAEmpty
+            (map (\(mdef, lid) -> (mdef, ISLocal lid)) locals),
+        linkSplit loopid,
+        linkAction $ IAMark lhspr . IAAssign
+            (IACall
+                (IASlot $ ISConst fiterid)
+                (IACons
+                    (IASlot $ ISConst fstateid)
+                    (IACons
+                        (IASlot $ ISLocal findexid)
+                        IAEmpty)))
+            (map (IASetLocal . snd) locals),
+        linkAction $ IAAssign
+            (IACons (IASlot (ISLocal firstlocalid)) IAEmpty)
+            [IASetLocal findexid],
+        linkBranch (IASlot $ ISLocal findexid)
+            (linkLocalBreak nextid $
+                pbody <> (linkLast $ makeDropBefore diffinner $ IABlock loopid))
+            (linkAction $ makeDropBefore diffouter),
+        linkSplit nextid]
 
-compileBody (StatNode (pr, StatFunction target value):others) prev = do
+compileStat (StatNode (pr, StatFunction target value)) = do
     let name = BSt.pack $ defString 0 target ""
     functionira <- compileFunction pr name value
     targetira <- compileExpressionWrite target
-    compileBody others (do
-        cprev <- prev
-        return (\after bbs -> do
-            let assignira = IAAssign
-                    (IACons functionira IAEmpty)
-                    [targetira]
-                    after
-            cprev
-                (IAMark pr assignira)
-                bbs))
+    return $ linkAction $
+        IAMark pr
+            . IAAssign
+                (IACons functionira IAEmpty)
+                [targetira]
 
-compileBody (StatNode (pr,
-        StatLocalFunction namenode value scope):others) prev = do
+compileStat (StatNode (pr, StatLocalFunction namenode value)) = do
     let (NameNode (namepr, name)) = namenode
-    oldscope <- lecxSlots <$> get
     lid <- lecxCreateLocal name namepr
     functionira <- compileFunction pr name value
-    pscope <- compileBody scope (return (,))
-    lecxSetSlots oldscope
-    compileBody others (do
-        cprev <- prev
-        cscope <- pscope
-        return (\after bbs -> do
-            let dropira = makeDropBefore [ISLocal lid] after
-            let (scopeira, scopebbs) = cscope dropira bbs
-            let initira = IAAssign
-                    (IACons functionira IAEmpty)
-                    [IASetLocal lid]
-                    scopeira
-            let openira = IAOpen
-                    IAEmpty
-                    [(Just (namepr, name), ISLocal lid)]
-                    initira
-            cprev
-                (IAMark pr openira)
-                scopebbs))
+    return $ linkAction $
+        IAMark pr
+            . IAOpen
+                IAEmpty
+                [(Just (namepr, name), ISLocal lid)]
+            . IAAssign
+                (IACons functionira IAEmpty)
+                [IASetLocal lid]
 
-compileBody (StatNode (pr, StatLocalDef lhs rhs mlast scope):others) prev = do
+compileStat (StatNode (pr, StatLocalDef lhs rhs mlast)) = do
     let targets = map (\(name, _) -> defString 0 name) lhs ++ repeat id
     sourcesira <- compileExpressionList targets rhs mlast
-    oldscope <- lecxSlots <$> get
-    locals <- forM lhs makeLocal
-    pscope <- compileBody scope (return (,))
-    lecxSetSlots oldscope
-    compileBody others (do
-        cprev <- prev
-        cscope <- pscope
-        return (\after bbs -> do
-            let droplist = reverse $ map snd locals
-            let dropira = makeDropBefore droplist after
-            let (scopeira, scopebbs) = cscope dropira bbs
-            let initira = IAOpen
-                    sourcesira
-                    locals
-                    scopeira
-            cprev
-                (IAMark pr initira)
-                scopebbs))
-
-    where
-    makeLocal (NameNode (pr', name), mattr) = do
+    locals <- forM lhs $ \(NameNode (pr', name), mattr) -> do
         case mattr of
             Nothing -> do
                 ix <- lecxCreateLocal name pr'
@@ -1164,55 +1072,48 @@ compileBody (StatNode (pr, StatLocalDef lhs rhs mlast scope):others) prev = do
                 ix <- lecxCreateGuard name pr'
                 return $ (Just (pr', name), ISGuard ix)
             _ -> lift $ Left $ CompileError pr "Invalid variable attribute"
+    return $ linkAction $
+        IAMark pr . IAOpen sourcesira locals
 
-compileBody (StatNode (pr,
-        StatReturn [] (Just (ExprNode (_,
-            ExprCall func args mlast)))):others) prev = do
+compileStat (StatNode (pr,
+        StatReturn [] (Just (ExprNode (_, ExprCall func args mlast))))) = do
     let argname n = "(argument " . shows (n :: Int) . " of "
             . defString 0 func . ")"
     let argtargets = map argname [1..]
     funcira <- compileExpressionRead "(return)" func
     argira <- compileExpressionList argtargets args mlast
-    compileBody others (do
-        cprev <- prev
-        return (\_ bbs -> do
-            cprev
-                (IAMark pr
-                    (IATailCall
-                        funcira
-                        argira))
-                bbs))
+    return $ linkLast $
+        IAMark pr $ IATailCall funcira argira
 
-compileBody (StatNode (pr,
+compileStat (StatNode (pr,
         StatReturn [] (Just (ExprNode (_,
-            ExprMethodCall obj name args mlast)))):others) prev = do
+            ExprMethodCall obj name args mlast))))) = do
     let argname n = "(argument " . shows (n :: Int) . " of "
             . defString 0 obj . ":" . unpackSt name . ")"
     let argtargets = map argname [1..]
     objira <- compileExpressionRead "(return)" obj
     let nameira = IAString name
     argira <- compileExpressionList argtargets args mlast
-    compileBody others (do
-        cprev <- prev
-        return (\_ bbs -> do
-            cprev
-                (IAMark pr
-                    (IATailCallMethod
-                        objira
-                        nameira
-                        argira))
-                bbs))
+    return $ linkLast $
+        IAMark pr $ IATailCallMethod objira nameira argira
 
-compileBody (StatNode (pr, StatReturn rhs mlast):others) prev = do
+compileStat (StatNode (pr, StatReturn rhs mlast)) = do
     let targets = map (\n -> "(return " . shows (n :: Int) . ")") [1..]
     valueira <- compileExpressionList targets rhs mlast
-    compileBody others (do
-        cprev <- prev
-        return (\_ bbs -> do
-            cprev
-                (IAMark pr
-                    (IAReturn valueira))
-                bbs))
+    return $ linkLast $
+        IAMark pr $ IAReturn valueira
+
+
+compileBody
+    :: [StatNode]
+    -> StateT LexicalContext (Either CompileError) Link
+compileBody body = do
+    foldM
+        (\buf stat -> do
+            mine <- compileStat stat
+            return $ buf <> mine)
+        mempty
+        body
 
 
 compileFunction
@@ -1241,11 +1142,12 @@ compileFunction pr name (ExprNode (_,
         lecxUpconsts = [],
         lecxVararg = isvararg,
         lecxBlocks = [(0, Nothing, [])]}
-    (pbody, context) <- lift $
-        runStateT (compileBody stats (return (,))) innerContext
+    (pbody, context) <- lift $ runStateT (compileBody stats) innerContext
     put $ fromJust $ lecxOuter context
-    cbody <- lift $ runReaderT pbody ((lecxBlocks context), Nothing)
-    let (main, bbs) = cbody (IAReturn IAEmpty) []
+    (main, bbs) <- lift $ link
+        pbody
+        ((lecxBlocks context), Nothing)
+        (IAReturn IAEmpty, [])
     let upvaluedecls = reverse $ map
             (\(name', pr', _, source) -> (source, Just (pr', name')))
             (lecxUpvalues context)
@@ -1278,9 +1180,11 @@ compileChunk filename stats = do
         lecxUpconsts = [],
         lecxVararg = True,
         lecxBlocks = [(0, Nothing, [])]}
-    (pbody, context) <- runStateT (compileBody stats (return (,))) baseContext
-    cbody <- runReaderT pbody ((lecxBlocks context), Nothing)
-    let (main, bbs) = cbody (IAReturn IAEmpty) []
+    (pbody, context) <- runStateT (compileBody stats) baseContext
+    (main, bbs) <- link
+        pbody
+        ((lecxBlocks context), Nothing)
+        (IAReturn IAEmpty, [])
     let (maxl, maxc, maxg) = lecxMaxIndex context
     return $!! (maxl, maxc, maxg, (0, main):bbs)
 
@@ -1296,3 +1200,17 @@ translateLua filename source = do
     errToStr :: (Show a) => Either a b -> Either String b
     errToStr (Left x) = Left $ show x
     errToStr (Right y) = Right y
+
+
+-- tt :: IO ()
+-- tt = do
+    -- let path = "test.lua"
+    -- source <- B.readFile path
+    -- case translateLua path source of
+        -- Left err -> putStrLn err
+        -- Right (maxl, maxc, maxg, body) -> do
+            -- let str = shows maxl $ "@ "
+                    -- $ shows maxc $ "% "
+                    -- $ shows maxg $ "&\n"
+                    -- $ defString 0 body $ ""
+            -- writeFile "testir.lua" str

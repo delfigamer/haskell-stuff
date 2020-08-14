@@ -1037,7 +1037,7 @@ lualibBase = do
             return $ [v])
     uncurry (luaSet env) =<<
         makef "" "rawset" (\args -> do
-            let t:k:v:_ = luaExtend 2 args
+            let t:k:v:_ = luaExtend 3 args
             luaRawSet t k v
             return $ [])
     uncurry (luaSet env) =<<
@@ -1046,6 +1046,17 @@ lualibBase = do
             _ <- parseArg 1 "string" luaToString a
             modvalue <- lpkRequire loaded searchers a
             return $ [modvalue])
+    uncurry (luaSet env) =<<
+        makef "" "select" (\args -> do
+            let a:rest = luaExtend 1 args
+            case a of
+                LString "#" -> do
+                    return $ [LInteger $ toInteger $ length $ rest]
+                _ -> do
+                    idx <- parseArg 1 "integer" luaToInteger a
+                    if idx > 0
+                        then return $ drop (fromInteger idx) $ rest
+                        else luaError $ errArgRange 1)
     uncurry (luaSet env) =<<
         makef "" "setmetatable" (\args -> do
             let a:b:_ = luaExtend 2 args

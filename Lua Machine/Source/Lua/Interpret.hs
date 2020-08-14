@@ -10,7 +10,6 @@ module Lua.Interpret (
 ) where
 
 
-import System.CPUTime
 import Control.Monad.Reader
 import Data.List
 import Data.Maybe
@@ -171,19 +170,20 @@ lirList !ctx ira = do
             return $ first:rest
 
 
-lirSink
+lirSinkPrepare
     :: LirContext q s
     -> IrSink
-    -> LuaValue q s
-    -> LuaState q s ()
-lirSink !ctx ira value = do
+    -> LuaState q s (LuaValue q s -> LuaState q s ())
+lirSinkPrepare !ctx ira = do
     case ira of
-        IASetLocal ix -> luaWrite (lirxLocals ctx A.! ix) $ value
-        IASetUpvalue ix -> luaWrite (lirxUpvalues ctx A.! ix) $ value
+        IASetLocal ix -> do
+            return $ luaWrite (lirxLocals ctx A.! ix)
+        IASetUpvalue ix -> do
+            return $ luaWrite (lirxUpvalues ctx A.! ix)
         IASetIndex tableira indexira -> do
             table <- lirValue ctx tableira
             index <- lirValue ctx indexira
-            luaSet table index value
+            return $ luaSet table index
 
 
 lirLocal
@@ -247,11 +247,8 @@ lirAction !ctx ira = do
     case ira of
         IAAssign sourceira sinks next -> do
             sources <- lirList ctx sourceira
-            zipWithM_
-                (\sink value -> do
-                    lirSink ctx sink value)
-                sinks
-                (sources ++ repeat LNil)
+            preps <- mapM (lirSinkPrepare ctx) sinks
+            zipWithM_ ($) preps (sources ++ repeat LNil)
             lirAction ctx next
         IAOpen sourceira targets next -> do
             sources <- lirList ctx sourceira
@@ -259,11 +256,8 @@ lirAction !ctx ira = do
         IASequence list next -> do
             _ <- lirList ctx list
             lirAction ctx next
-        IADrop [] _ -> undefined
-        IADrop (s:ss) next -> do
-            case ss of
-                [] -> return $ Right $ next
-                _ -> return $ Right $ IADrop ss next
+        IADrop _ next -> do
+            return $ Right $ next
         IAReturn listira -> do
             result <- lirList ctx listira
             return $ Left $ Right $ result
@@ -284,7 +278,7 @@ lirAction !ctx ira = do
                 else lirAction ctx neg
         IABlock bix -> do
             case lookup bix $ lirxBody ctx of
-                Just ira -> lirAction ctx ira
+                Just blockira -> lirAction ctx blockira
                 Nothing -> lirInvalid
         IAMark pr next -> do
             luadSetLocation $ Just pr

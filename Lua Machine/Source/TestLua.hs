@@ -11,8 +11,6 @@ import Data.Maybe
 import qualified Data.ByteString.Char8 as BSt
 import qualified Data.ByteString.Lazy.Char8 as B
 import Lua
-import Lua.SourceRange
-import Lua.Translate
 
 
 data WithTraceback q s = WithTraceback

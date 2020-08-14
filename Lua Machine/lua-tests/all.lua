@@ -142,12 +142,12 @@ end
 dofile('main.lua')
 
 
--- assert(dofile('calls.lua') == deep and deep) -- OK
--- olddofile('strings.lua') -- OK
--- olddofile('literals.lua') -- OK
--- dofile('tpack.lua') -- OK
-assert(dofile('attrib.lua') == 27)
-dofile('gengc.lua')
+assert(dofile('calls.lua') == deep and deep) -- OK
+olddofile('strings.lua') -- OK
+olddofile('literals.lua') -- OK
+dofile('tpack.lua') -- OK
+assert(dofile('attrib.lua') == 27) -- OK
+dofile('gengc.lua') -- OK
 assert(dofile('locals.lua') == 5)
 dofile('constructs.lua')
 dofile('code.lua', true)
