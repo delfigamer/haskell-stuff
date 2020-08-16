@@ -27,7 +27,15 @@ instance LuaMetatype WithTraceback where
                     let prs = maybe "" (BSt.pack . show) mpr
                     name <> "\t" <> prs)
                 tb
-        return $ BSt.intercalate "\n" (msg:tblines)
+        return $ BSt.intercalate "\n" (msg:filterrep False "" tblines)
+        where
+        filterrep reps _ []
+            | reps = ["\t..."]
+            | otherwise = []
+        filterrep reps prev (current:rest)
+            | prev == current = filterrep True prev rest
+            | reps = "\t\t...":current:filterrep False current rest
+            | otherwise = current:filterrep False current rest
 
 
 grabTraceback :: LuaErrorHandler q s
@@ -97,11 +105,11 @@ runLuaA
     -> (forall q s . [LuaValue q s])
     -> IO ()
 runLuaA input args = do
-    r <- luaRunIO $ luaWithErrHandler grabTraceback (do
+    r <- luaRunIO $ luaWithErrHandler grabTraceback $ do
         env <- lualibs
         r <- luaDo (B.pack input) env args
         luaLiftIO $ print r
-        return ())
+        return ()
     case r of
         Left e -> putStrLn $ e
         Right _ -> return ()

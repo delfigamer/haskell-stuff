@@ -1,4 +1,5 @@
 {-# LANGUAGE BangPatterns #-}
+{-# LANGUAGE FlexibleContexts #-}
 {-# LANGUAGE OverloadedStrings #-}
 
 
@@ -28,7 +29,7 @@ data LirContext q s = LirContext {
     lirxVararg :: ![LuaValue q s],
     lirxUpvalues :: !(A.Array Int (LuaRef q s (LuaValue q s))),
     lirxUpconsts :: !(A.Array Int (LuaValue q s)),
-    lirxLocals :: !(A.Array Int (LuaRef q s (LuaValue q s))),
+    lirxLocals :: !(V.STArray s Int (LuaRef q s (LuaValue q s))),
     lirxConsts :: !(V.STArray s Int (LuaValue q s)),
     lirxGuards :: !(V.STArray s Int (LuaValue q s))}
 
@@ -53,7 +54,8 @@ lirValue !ctx ira = do
             let ikvs = zip (map LInteger [1..]) ivs ++ kvs
             luaCreateTable ikvs
         IASlot (ISLocal ix) -> do
-            luaRead $ lirxLocals ctx A.! ix
+            ref <- luaLiftST $ V.readArray (lirxLocals ctx) ix
+            luaRead $ ref
         IASlot (ISConst ix) -> do
             luaLiftST $ V.readArray (lirxConsts ctx) ix
         IASlot (ISGuard ix) -> do
@@ -110,15 +112,16 @@ lirValue !ctx ira = do
                 mlocation upvaluedefs upconstdefs paramdefs
                 maxl maxc maxg funcbody -> do
             upvalues <- forM upvaluedefs (\(source, mdef) -> do
-                let !ref = case source of
-                        Left ix -> lirxUpvalues ctx A.! ix
-                        Right ix -> lirxLocals ctx A.! ix
+                ref <- case source of
+                    Left ix -> return $! lirxUpvalues ctx A.! ix
+                    Right ix -> luaLiftST $ V.readArray (lirxLocals ctx) ix
                 return $ (mdef, ref))
             upconsts <- forM upconstdefs (\(source, mdef) -> do
                 value <- case source of
                         Left ix -> return $! lirxUpconsts ctx A.! ix
                         Right (ISLocal ix) -> do
-                            luaRead $ lirxLocals ctx A.! ix
+                            ref <- luaLiftST $ V.readArray (lirxLocals ctx) ix
+                            luaRead $ ref
                         Right (ISConst ix) -> do
                             luaLiftST $ V.readArray (lirxConsts ctx) ix
                         Right (ISGuard ix) -> do
@@ -177,7 +180,8 @@ lirSinkPrepare
 lirSinkPrepare !ctx ira = do
     case ira of
         IASetLocal ix -> do
-            return $ luaWrite (lirxLocals ctx A.! ix)
+            ref <- luaLiftST $ V.readArray (lirxLocals ctx) ix
+            return $ luaWrite ref
         IASetUpvalue ix -> do
             return $ luaWrite (lirxUpvalues ctx A.! ix)
         IASetIndex tableira indexira -> do
@@ -195,8 +199,11 @@ lirLocal
 lirLocal !ctx !value (mdef, slot) act = do
     case slot of
         ISLocal ix -> do
-            luaWrite (lirxLocals ctx A.! ix) $ value
-            luadWithinLocal mdef (Left value) $ act
+            ref <- luaAlloc $ value
+            luaLiftST $ V.writeArray (lirxLocals ctx) ix $ ref
+            r <- luadWithinLocal mdef (Right ref) $ act
+            luaLiftST $ V.writeArray (lirxLocals ctx) ix $ undefined
+            return $ r
         ISConst ix -> do
             luaLiftST $ V.writeArray (lirxConsts ctx) ix $ value
             luadWithinLocal mdef (Left value) $ act
@@ -319,10 +326,7 @@ lirFunction mlocation upvalues upconsts paramdefs maxl maxc maxg funcbody = do
             map (\(mdef, ref) -> (mdef, Right ref)) upvalues
             ++ map (\(mdef, value) -> (mdef, Left value)) upconsts
     \args -> do
-        locals <- replicateM maxl $ luaAlloc LNil
-        let !localArray = A.listArray
-                (0, maxl - 1)
-                locals
+        localArray <- luaLiftST $ V.newArray (0, maxl - 1) undefined
         constArray <- luaLiftST $ V.newArray (0, maxc - 1) LNil
         guardArray <- luaLiftST $ V.newArray (0, maxg - 1) LNil
         (vararg, argvarlist) <- parseArgs localArray paramdefs args
@@ -341,8 +345,8 @@ lirFunction mlocation upvalues upconsts paramdefs maxl maxc maxg funcbody = do
         return $ (args, [])
     parseArgs localArray ((ix, mdef):ps) args = do
         let (arg, as) = fromMaybe (LNil, []) (uncons args)
-        let ref = localArray A.! ix
-        luaWrite ref arg
+        ref <- luaAlloc arg
+        luaLiftST $ V.writeArray localArray ix $ ref
         (vararg, argvarlist) <- parseArgs localArray ps as
         return $ (vararg, (mdef, Right ref):argvarlist)
 

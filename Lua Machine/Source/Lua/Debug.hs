@@ -12,6 +12,7 @@ module Lua.Debug (
     luadRunFunction,
     luadSetDebugHook,
     luadSetLocation,
+    luadSetStackLimit,
     luadWithinLocal,
 ) where
 
@@ -93,7 +94,7 @@ luadRunFunction mdef upvalues args act = do
         lsfCurrentLocation = locationRef,
         lsfUpvalues = upvalues,
         lsfLocals = args}
-    result <- lxLocalStack (lstackFrame:) (do
+    result <- lxStackLevel $ lxLocalStack (lstackFrame:) $ do
         (callhookf, callflag, _, _) <- lxGetDebugHook
         when callflag (do
             () <$ lxCall callhookf [LString "call"])
@@ -102,7 +103,7 @@ luadRunFunction mdef upvalues args act = do
         when retflag (do
             () <$ lxCall rethookf [
                 LString $ either (const "tail call") (const "return") result'])
-        return $ result')
+        return $ result'
     case result of
         Left (tailfunc, args') -> tailfunc args'
         Right rets -> return rets
@@ -117,3 +118,8 @@ luadSetDebugHook
     :: (LuaValue q s, Bool, Bool, Bool)
     -> LuaState q s ()
 luadSetDebugHook = lxSetDebugHook
+
+
+luadSetStackLimit
+    :: Int -> LuaState q s (Maybe Int)
+luadSetStackLimit = lxSetStackLimit

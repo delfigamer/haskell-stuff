@@ -742,10 +742,19 @@ matchFrontier test next source pos caps = do
 data PatternParserState q s = PatternParserState {
     ppsCaptures :: Int -> [Maybe Bool] -> [Maybe Bool],
     ppsChars :: Maybe (String -> String),
-    ppsElems :: Matcher q s -> Matcher q s}
+    ppsElems :: Matcher q s -> Matcher q s,
+    ppsComplexity :: !Int}
 
 
 type PatternParser q s = Parsec BSt.ByteString (PatternParserState q s)
+
+
+readPatternCheckComplexity :: PatternParser q s ()
+readPatternCheckComplexity = do
+    pps <- getState
+    if ppsComplexity pps > 1000
+        then fail "Pattern is too complex"
+        else return ()
 
 
 readPatternPushChar :: Char -> PatternParser q s ()
@@ -762,12 +771,15 @@ readPatternPushElement el = do
         case ppsChars pps of
             Nothing -> do
                 pps {
-                    ppsElems = ppsElems pps . el}
+                    ppsElems = ppsElems pps . el,
+                    ppsComplexity = ppsComplexity pps + 1}
             Just buf -> do
                 let charElem = matchLiteral (BSt.pack $ buf "")
                 pps {
                     ppsChars = Nothing,
-                    ppsElems = ppsElems pps . charElem . el})
+                    ppsElems = ppsElems pps . charElem . el,
+                    ppsComplexity = ppsComplexity pps + 1})
+    readPatternCheckComplexity
 
 
 readPatternCategory
@@ -815,14 +827,23 @@ readPatternClass
     :: PatternParser q s (Either (Char -> Bool) Char)
 readPatternClass = do
     _ <- char '['
+    inverse <- option False (True <$ char '^')
     set <- readElems Nothing
-    case set of
-        Nothing -> do
-            return $ Left $ const False
-        Just (Right ch) -> do
+    case (inverse, set) of
+        (_, Nothing) -> do
+            return $ Left $ const inverse
+        (False, Just (Right ch)) -> do
             return $ Right $ ch
-        Just (Left func) -> do
-            let list = listArray ('\0', '\255') $ map func ['\0' .. '\255']
+        (False, Just (Left func)) -> do
+            let list = listArray ('\0', '\255') $
+                    map func ['\0' .. '\255']
+            let func' x = (list :: UArray Char Bool) ! x
+            return $ seq list $ Left $ func'
+        (True, Just (Right ch)) -> do
+            return $ Left $ (/=ch)
+        (True, Just (Left func)) -> do
+            let list = listArray ('\0', '\255') $
+                    map (not . func) ['\0' .. '\255']
             let func' x = (list :: UArray Char Bool) ! x
             return $ seq list $ Left $ func'
     where
@@ -993,7 +1014,8 @@ parsePattern skipStart source = do
     let initstate = PatternParserState {
         ppsCaptures = (\_ -> id),
         ppsChars = Nothing,
-        ppsElems = id}
+        ppsElems = id,
+        ppsComplexity = 0}
     case runParser readf initstate "" source of
         Left err -> Left $ BSt.pack $ show err
         Right matchers -> Right $ (\buf spos -> matchers buf spos (const id))

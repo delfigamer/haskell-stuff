@@ -566,7 +566,7 @@ compileVariable (NameNode (pr, name)) = do
 compileExpressionRead
     :: ShowS
     -> ExprNode
-    -> StateT LexicalContext (Either CompileError) IrValue
+    -> Compile IrValue
 compileExpressionRead _ (ExprNode (_, ExprNil)) = do
     return $ IANil
 compileExpressionRead _ (ExprNode (_, ExprBool b)) = do
@@ -672,7 +672,7 @@ compileExpressionRead target expr = do
 compileExpressionReadLast
     :: ShowS
     -> ExprNode
-    -> StateT LexicalContext (Either CompileError) IrList
+    -> Compile IrList
 compileExpressionReadLast _ (ExprNode (pr, ExprEllipsis)) = do
     vararg <- lecxVararg <$> get
     if vararg
@@ -701,7 +701,7 @@ compileExpressionReadLast _ _ = do
 
 compileExpressionWrite
     :: ExprNode
-    -> StateT LexicalContext (Either CompileError) IrSink
+    -> Compile IrSink
 compileExpressionWrite (ExprNode (pr, ExprVar namenode)) = do
     disp <- compileVariable namenode
     disp
@@ -730,7 +730,7 @@ compileExpressionList
     :: [ShowS]
     -> [ExprNode]
     -> Maybe ExprNode
-    -> StateT LexicalContext (Either CompileError) IrList
+    -> Compile IrList
 compileExpressionList _ [] Nothing = do
     return $ IAEmpty
 compileExpressionList (t:_) [] (Just final) = do
@@ -852,7 +852,7 @@ makeDropBefore (slot:rest) after
 
 compileStat
     :: StatNode
-    -> StateT LexicalContext (Either CompileError) Link
+    -> Compile Link
 
 compileStat (StatNode (_, StatNull)) = do
     return $ mempty
@@ -932,7 +932,8 @@ compileStat (StatNode (_, StatRepeat body cond)) = do
                     (linkLast $ makeDropBefore diff $ IABlock loopid),
         linkSplit nextid]
 
-compileStat (StatNode (pr, StatIf cond tbody estat)) = do
+compileStat (StatNode (_, StatIf cond tbody estat)) = do
+    let ExprNode (condpr, _) = cond
     condira <- compileExpressionRead "(if condition)" cond
     scope <- lecxSaveScope
     ptbody <- compileBody tbody
@@ -940,7 +941,7 @@ compileStat (StatNode (pr, StatIf cond tbody estat)) = do
     pestat <- compileStat estat
     nextid <- lecxNewBlock
     return $ mconcat [
-        linkAction $ IAMark pr,
+        linkAction $ IAMark condpr,
         linkBranch condira
             (ptbody <> (linkAction $ makeDropBefore diff))
             pestat,
@@ -1071,42 +1072,49 @@ compileStat (StatNode (pr, StatLocalDef lhs rhs mlast)) = do
             Just "close" -> do
                 ix <- lecxCreateGuard name pr'
                 return $ (Just (pr', name), ISGuard ix)
-            _ -> lift $ Left $ CompileError pr "Invalid variable attribute"
+            Just attr -> lift $ Left $ CompileError pr $
+                "Unknown attribute <" ++ BSt.unpack attr ++ ">"
     return $ linkAction $
         IAMark pr . IAOpen sourcesira locals
 
-compileStat (StatNode (pr,
-        StatReturn [] (Just (ExprNode (_, ExprCall func args mlast))))) = do
-    let argname n = "(argument " . shows (n :: Int) . " of "
-            . defString 0 func . ")"
-    let argtargets = map argname [1..]
-    funcira <- compileExpressionRead "(return)" func
-    argira <- compileExpressionList argtargets args mlast
-    return $ linkLast $
-        IAMark pr $ IATailCall funcira argira
-
-compileStat (StatNode (pr,
-        StatReturn [] (Just (ExprNode (_,
-            ExprMethodCall obj name args mlast))))) = do
-    let argname n = "(argument " . shows (n :: Int) . " of "
-            . defString 0 obj . ":" . unpackSt name . ")"
-    let argtargets = map argname [1..]
-    objira <- compileExpressionRead "(return)" obj
-    let nameira = IAString name
-    argira <- compileExpressionList argtargets args mlast
-    return $ linkLast $
-        IAMark pr $ IATailCallMethod objira nameira argira
-
 compileStat (StatNode (pr, StatReturn rhs mlast)) = do
-    let targets = map (\n -> "(return " . shows (n :: Int) . ")") [1..]
-    valueira <- compileExpressionList targets rhs mlast
-    return $ linkLast $
-        IAMark pr $ IAReturn valueira
+    slots <- lecxSlots <$> get
+    let hasGuards = checkGuards slots
+    case (rhs, mlast) of
+        ([], Just (ExprNode (_, elast)))
+            | ExprCall func args arglast <- elast, not hasGuards -> do
+                let argname n = "(argument " . shows (n :: Int) . " of "
+                        . defString 0 func . ")"
+                let argtargets = map argname [1..]
+                funcira <- compileExpressionRead "(return)" func
+                argira <- compileExpressionList argtargets args arglast
+                return $ linkLast $
+                    IAMark pr $ IATailCall funcira argira
+            | ExprMethodCall obj name args arglast <- elast, not hasGuards -> do
+                let argname n = "(argument " . shows (n :: Int) . " of "
+                        . defString 0 obj . ":" . unpackSt name . ")"
+                let argtargets = map argname [1..]
+                objira <- compileExpressionRead "(return)" obj
+                let nameira = IAString name
+                argira <- compileExpressionList argtargets args arglast
+                return $ linkLast $
+                    IAMark pr $ IATailCallMethod objira nameira argira
+        _ -> do
+            let targets = map (\n -> "(return " . shows (n :: Int) . ")") [1..]
+            valueira <- compileExpressionList targets rhs mlast
+            return $ linkLast $
+                IAMark pr $ IAReturn valueira
+    where
+    checkGuards slots = do
+        case slots of
+            [] -> False
+            (_, _, _, ISGuard _):_ -> True
+            (_, _, _, _):rest -> checkGuards rest
 
 
 compileBody
     :: [StatNode]
-    -> StateT LexicalContext (Either CompileError) Link
+    -> Compile Link
 compileBody body = do
     foldM
         (\buf stat -> do
@@ -1120,7 +1128,7 @@ compileFunction
     :: SourceRange
     -> BSt.ByteString
     -> ExprNode
-    -> StateT LexicalContext (Either CompileError) IrValue
+    -> Compile IrValue
 compileFunction pr name (ExprNode (_,
         ExprFunction paramnodes mvarargnode stats)) = do
     let isvararg = isJust mvarargnode

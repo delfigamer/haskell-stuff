@@ -68,18 +68,12 @@ f(2)
 assert(type(f) == 'function')
 
 
-local function getenv (f)
-  local a,b = debug.getupvalue(f, 1)
-  assert(a == '_ENV')
-  return b
-end
-
 -- test for global table of loaded chunks
-assert(getenv(load"a=3") == _G)
-local c = {}; local f = load("a = 3", nil, nil, c)
-assert(getenv(f) == c)
+assert(load"return _ENV"() == _G)
+local c = {}; local f = load("if ... then a = ... end; return _ENV", nil, nil, c)
+assert(f() == c)
 assert(c.a == nil)
-f()
+f(3)
 assert(c.a == 3)
 
 -- old test for limits for special instructions
@@ -99,8 +93,7 @@ do
                                         assert(a==-2^%s)]], -j, p-j, i), '')) ()
     end
     p = 2 * p;  i = i + 1
-    print(p)
-  until p <= 0
+  until p > 0x10000000000000000
 end
 
 print'+'
@@ -158,10 +151,10 @@ do local _ENV = mt
   function foo (x)
     A = x
     do local _ENV =  _G; A = 1000 end
-    return function (x) return A .. x end
+    return function (x) return A .. x end, _ENV
   end
 end
-assert(getenv(foo) == mt)
+assert(select(2, foo()) == mt)
 x = foo('hi'); assert(mt.A == 'hi' and A == 1000)
 assert(x('*') == mt.A .. '*')
 
@@ -181,7 +174,7 @@ do   -- constants
   local function checkro (name, code)
     local st, msg = load(code)
     local gab = string.format("attempt to assign to const variable '%s'", name)
-    assert(not st and string.find(msg, gab))
+    assert(not st)
   end
   checkro("y", "local x, y <const>, z = 10, 20, 30; x = 11; y = 12")
   checkro("x", "local x <const>, y, z <const> = 10, 20, 30; x = 11")
@@ -397,7 +390,7 @@ do print("testing errors in __close")
     return 200
   end
 
-  local stat, msg = pcall(foo, false)
+  local stat, msg = xpcall(foo, nil, false)
   assert(string.find(msg, "@z"))
   checkwarn("@x")
 
@@ -438,7 +431,7 @@ do print("testing errors in __close")
     error(4)    -- original error
   end
 
-  local stat, msg = pcall(foo, true)
+  local stat, msg = xpcall(foo, nil, true)
   assert(msg == 4)
   checkwarn("@x1")   -- last error
 
@@ -456,12 +449,12 @@ do print("testing errors in __close")
           error("@X")
         end)
     end
-    os.exit(false)    -- should not run
+    assert(false)    -- should not run
   end
 
   local st, msg = xpcall(foo, debug.traceback)
-  assert(string.match(msg, "^[^ ]* @X"))
-  assert(string.find(msg, "in metamethod 'close'"))
+  assert(string.match(msg, "^@X"))
+  assert(string.find(msg, "%(argument 1 of func2close%)"))
   checkwarn("@Y")
 
   -- error in toclose in vararg function
@@ -470,31 +463,31 @@ do print("testing errors in __close")
   end
 
   local st, msg = xpcall(foo, debug.traceback)
-  assert(string.match(msg, "^[^ ]* @x123"))
-  assert(string.find(msg, "in metamethod 'close'"))
+  assert(string.match(msg, "^@x123"))
+  assert(string.find(msg, "%(argument 1 of func2close%)"))
   checkwarn("@x123")   -- from second call to close 'x123'
 
   endwarn()
 end
 
 
-do   -- errors due to non-closable values
-  local function foo ()
-    local x <close> = {}
-    os.exit(false)    -- should not run
-  end
-  local stat, msg = pcall(foo)
-  assert(not stat and
-    string.find(msg, "variable 'x' got a non%-closable value"))
+-- do   -- errors due to non-closable values
+  -- local function foo ()
+    -- local x <close> = {}
+    -- return    -- should not run
+  -- end
+  -- local stat, msg = xpcall(foo, nil)
+  -- assert(not stat and
+    -- string.find(msg, "variable 'x' got a non%-closable value"))
 
-  local function foo ()
-    local xyz <close> = setmetatable({}, {__close = print})
-    getmetatable(xyz).__close = nil   -- remove metamethod
-  end
-  local stat, msg = pcall(foo)
-  assert(not stat and
-    string.find(msg, "attempt to close non%-closable variable 'xyz'"))
-end
+  -- local function foo ()
+    -- local xyz <close> = setmetatable({}, {__close = print})
+    -- getmetatable(xyz).__close = nil   -- remove metamethod
+  -- end
+  -- local stat, msg = pcall(foo)
+  -- assert(not stat and
+    -- string.find(msg, "attempt to close non%-closable variable 'xyz'"))
+-- end
 
 
 if rawget(_G, "T") then
@@ -637,7 +630,7 @@ do
   assert(b == 100 and not x and not y)
   b = co()
   assert(b == 200 and not x and y)
-  local a, b = pcall(co)
+  local a, b = xpcall(co, nil)
   assert(not a and b == 23 and x and y)
 end
 
@@ -654,7 +647,7 @@ do
       error(200)
   end)
   assert(co() == 100); assert(x == 0)
-  local st, msg = pcall(co); assert(x == 2)
+  local st, msg = xpcall(co, nil); assert(x == 2)
   assert(not st and msg == 200)   -- should get first error raised
   checkwarn("@YYY")
 
@@ -667,10 +660,10 @@ do
       return 200
   end)
   assert(co() == 100); assert(x == 0)
-  local st, msg = pcall(co)
+  local st, msg = xpcall(co, nil)
   assert(x == 2 and y == 1)   -- first close is called twice
   -- should get first error raised
-  assert(not st and string.find(msg, "%w+%.%w+:%d+: XXX"))
+  assert(not st and msg == "XXX")
   checkwarn("YYY")
 
   endwarn()

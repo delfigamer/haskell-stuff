@@ -152,6 +152,38 @@ luaopenCoroutine env = do
     registerLib coroutine "coroutine" env
 
 
+debugTraceback :: Int -> LuaState q s BSt.ByteString
+debugTraceback level
+    | level < 0 = return $ "Stack traceback:"
+    | otherwise = do
+        stack <- luadGetStack
+        parts <- mapM infoLine $ stack
+        let str = "Stack traceback:" ++ foldr ($) "" (filterrep False id parts)
+        return $ BSt.pack str
+    where
+    infoLine lsf = do
+        mcloc <- luaRead $ lsfCurrentLocation lsf
+        case (mcloc, lsfDefinition lsf) of
+            (Just cloc, Just (_, fname)) -> do
+                return $ ("\n\t" ++) . shows cloc . (": " ++) . unpackSt fname
+            (Nothing, Just (defloc, fname)) -> do
+                return $
+                    ("\n\t" ++) . shows (collapseRangeNull defloc)
+                        . (": " ++) . unpackSt fname
+            (Just cloc, Nothing) -> do
+                return $ ("\n\t" ++) . shows cloc
+            (Nothing, Nothing) -> do
+                return $ id
+    unpackSt str rest = BSt.foldr (:) rest str
+    filterrep reps _ []
+        | reps = [("\n\t\t..." ++)]
+        | otherwise = []
+    filterrep reps prev (current:rest)
+        | prev "" == current "" = filterrep True prev rest
+        | reps = ("\t\t..." ++):current:filterrep False current rest
+        | otherwise = current:filterrep False current rest
+
+
 luaopenDebug :: LuaValue q s -> LuaState q s ()
 luaopenDebug env = do
     let interactiveMode = do
@@ -250,7 +282,27 @@ luaopenDebug env = do
                         then luadSetDebugHook $
                             (a, callflag, returnflag, lineflag)
                         else luadSetDebugHook (LNil, False, False, False)
-            return $ [])]
+            return $ []),
+        makef "debug." "setcstacklimit" (\args -> do
+            let a:_ = luaExtend 1 args
+            newlimit <- parseArg 1 "integer" luaToInteger a
+            moldlimit <- luadSetStackLimit $ fromInteger newlimit
+            case moldlimit of
+                Nothing -> return $ [LBool False]
+                Just oldlimit -> return $ [LInteger $ toInteger oldlimit]),
+        makef "debug." "traceback" (\args -> do
+            let a:b:_ = luaExtend 2 args
+            case a of
+                LNil -> do
+                    level <- parseArgDef 2 "integer" luaToInteger 1 b
+                    tb <- debugTraceback $ fromInteger level
+                    return $ [LString $ tb]
+                _
+                    | Just message <- luaToString a -> do
+                        level <- parseArgDef 2 "integer" luaToInteger 1 b
+                        tb <- debugTraceback $ fromInteger level
+                        return $ [LString $ message <> "\n" <> tb]
+                    | otherwise -> return $ [a])]
     registerLib debug "debug" env
 
 
@@ -265,6 +317,33 @@ luaopenIo env = do
                         _ -> putStr $ show arg)
             return $ [])]
     registerLib io "io" env
+
+
+mathFMod :: LuaValue q s -> LuaValue q s -> LuaState q s (LuaValue q s)
+mathFMod a b = do
+    luaToNumber2 a b
+        (luaError $ errArgType 1 "number" a)
+        (luaError $ errArgType 2 "number" b)
+        doInteger
+        doRational
+        doDouble
+    where
+    doInteger x y =
+        if y == 0
+            then luaError $ errDivideZero
+            else return $ LInteger $ rem x y
+    doRational x y =
+        if y == 0
+            then doDouble (fromRational x) (fromRational y)
+            else return $ LRational $ x - y * fromInteger (truncate (x / y))
+    doDouble x y =
+        return $ LDouble $
+            if isInfinite y
+                then x
+                else let r = x / y in
+                    if isNaN r || isInfinite r
+                        then (0/0)
+                        else x - y * fromInteger (truncate r)
 
 
 luaopenMath :: LuaValue q s -> LuaState q s ()
@@ -296,6 +375,10 @@ luaopenMath env = do
                             then return $ [LInteger $ numerator rat]
                             else return $ [LRational $ rat]
                 _ -> luaError $ errArgType 1 "number" a),
+        makef "math." "fmod" (\args -> do
+            let a:b:_ = luaExtend 2 args
+            r <- mathFMod a b
+            return $ [r]),
         return $ (LString "huge", LDouble $ 1/0),
         makef "math." "inexact" (\args -> do
             let a:_ = luaExtend 1 args
@@ -304,6 +387,19 @@ luaopenMath env = do
                 LRational x -> return $ [LDouble $ fromRational x]
                 LDouble _ -> return $ [a]
                 _ -> luaError $ errArgType 1 "number" a),
+        makef "math." "max" (\args -> do
+            case args of
+                [] -> luaError $ LString "Expected any values, got none"
+                first:rest -> do
+                    r <- foldM
+                        (\current next -> do
+                            lt <- luaCompareLt current next
+                            if lt
+                                then return $ next
+                                else return $ current)
+                        first
+                        rest
+                    return $ [r]),
         return $ (LString "maxinteger", LInteger $ 2 ^ (63::Int) - 1),
         return $ (LString "mininteger", LInteger $ - 2 ^ (63::Int)),
         return $ (LString "pi", LDouble $ pi),
@@ -671,6 +767,20 @@ luaopenString env = do
                             else x)
                     source
             return $ [LString $ result]),
+        makef "string." "match" (\args -> do
+            let a:b:c:_ = luaExtend 3 args
+            source <- parseArg 1 "string" luaToString a
+            pattern <- parseArg 2 "string" luaToString b
+            first <- parseArgDef 3 "integer" luaToInteger 1 c
+            let pos = stringOffset source first
+            parts <- luaBreakString False source pattern pos
+            case uncons $ rights parts of
+                Nothing -> return $ [LNil]
+                Just (match, _) -> do
+                    case match of
+                        [cap] -> return $ [cap]
+                        _:caps -> return $ caps
+                        _ -> return $ [LNil]),
         makef "string." "pack" (\args -> do
             let a:vals = luaExtend 1 args
             pattern <- parseArg 1 "string" luaToString a
@@ -866,7 +976,8 @@ lualibBase = do
         (LString "config", LString "\\\n;\n?\n\n"),
         (LString "path", LString "?.lua;?\\init.lua"),
         (LString "prefix", LString "")]
-    loaded <- luaNewTable
+    loaded <- luaCreateTable [
+        (LString "package", package)]
     luaSet package (LString "loaded") loaded
     preload <- luaNewTable
     luaSet package (LString "preload") preload
@@ -916,7 +1027,9 @@ lualibBase = do
             let r:e:_ = luaExtend 2 args
             if luaToBoolean r
                 then return $ args
-                else luaError e)
+                else case e of
+                    LNil -> luaError $ LString "Assertion failed"
+                    _ -> luaError e)
     uncurry (luaSet env) =<<
         makef "" "collectgarbage" (\args -> do
             let a:_ = luaExtend 1 args
@@ -964,14 +1077,18 @@ lualibBase = do
     inext <- luaCreateFunction (\args -> do
         let list:b:_ = luaExtend 2 args
         index <- parseArg 2 "integer" luaToInteger b
-        value <- luaGet list (LInteger index)
+        let nexti = LInteger $ index + 1
+        value <- luaGet list nexti
         case value of
             LNil -> return $ []
-            _ -> return $ [LInteger (index+1), value])
+            _ -> return $ [nexti, value])
     uncurry (luaSet env) =<<
         makef "" "ipairs" (\args -> do
             let list:_ = luaExtend 1 args
-            return $ [inext, list, LInteger 1])
+            case list of
+                LNil -> luaError $ errArgType 1 "table" list
+                _ -> return ()
+            return $ [inext, list, LInteger 0])
     uncurry (luaSet env) =<<
         makef "" "load" (\args -> do
             let a:b:c:cs = luaExtend 3 args
@@ -1008,6 +1125,9 @@ lualibBase = do
     uncurry (luaSet env) =<<
         makef "" "pairs" (\args -> do
             let list:_ = luaExtend 1 args
+            case list of
+                LTable _ _ -> return ()
+                _ -> luaError $ errArgType 1 "table" list
             piter <- luaAlloc =<< luaPairs list
             stepfunc <- luaCreateFunction (\_ -> do
                 iter <- luaRead piter
@@ -1055,7 +1175,7 @@ lualibBase = do
                 _ -> do
                     idx <- parseArg 1 "integer" luaToInteger a
                     if idx > 0
-                        then return $ drop (fromInteger idx) $ rest
+                        then return $ drop (fromInteger idx - 1) $ rest
                         else luaError $ errArgRange 1)
     uncurry (luaSet env) =<<
         makef "" "setmetatable" (\args -> do
@@ -1104,6 +1224,27 @@ lualibBase = do
             case args of
                 a:_ -> return $ [LString $ luaTypename a]
                 _ -> luaError $ LString "Expected a value, none was given")
+    uncurry (luaSet env) =<<
+        makef "" "warn" (\args -> do
+            let a:_ = luaExtend 1 args
+            luaWarn a
+            return $ [])
+    uncurry (luaSet env) =<<
+        makef "" "xpcall" (\args -> do
+            let a:b:as = luaExtend 2 args
+            mhandler <- parseArgMaybe 2 "function" luaToFunction b
+            let errh = case mhandler of
+                    Just ff -> \e -> do
+                        rets <- ff [e]
+                        case rets of
+                            LNil:_ -> return $ e
+                            r:_ -> return $ r
+                            _ -> return $ e
+                    Nothing -> return
+            res <- luaWithErrHandler errh $ luaTry $ luaCall a as
+            case res of
+                Left err -> return $ [LBool False, err]
+                Right rets -> return $ LBool True:rets)
     luaSet env (LString "package") package
     luaSet env (LString "_G") env
     return $ env

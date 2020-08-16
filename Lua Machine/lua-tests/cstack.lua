@@ -34,7 +34,11 @@ print("current stack limit: " .. currentlimit)
 
 local function checkerror (msg, f, ...)
   local s, err = pcall(f, ...)
-  assert(not s and string.find(err, msg))
+  assert(not s)
+  if not string.find(tostring(err), msg) then
+    print(err, msg)
+    assert(false)
+  end
 end
 
 -- auxiliary function to keep 'count' on the screen even if the program
@@ -44,7 +48,8 @@ local back = string.rep("\b", 8)
 local function progress ()
   count = count + 1
   local n = string.format("%-8d", count)
-  io.stderr:write(back, n)   -- erase previous value and write new one
+  -- io.stderr:write(back, n)   -- erase previous value and write new one
+  io.write(back, n)   -- erase previous value and write new one
 end
 
 
@@ -54,7 +59,7 @@ do    print("testing simple recursion:")
     progress()
     foo()   -- do recursive calls until a stack error (or crash)
   end
-  checkerror("stack overflow", foo)
+  checkerror("Stack overflow", foo)
   print("\tfinal count: ", count)
 end
 
@@ -66,7 +71,7 @@ do  print("testing stack overflow in message handling")
     return 1 + loop(x, y, z)
   end
   local res, msg = xpcall(loop, loop)
-  assert(msg == "error in error handling")
+  assert(not res)
   print("\tfinal count: ", count)
 end
 
@@ -90,7 +95,7 @@ do  print("testing stack-overflow in recursive 'gsub'")
     progress()
     string.gsub("a", ".", foo)
   end
-  checkerror("stack overflow", foo)
+  checkerror("Stack overflow", foo)
   print("\tfinal count: ", count)
 
   print("testing stack-overflow in recursive 'gsub' with metatables")
@@ -101,7 +106,7 @@ do  print("testing stack-overflow in recursive 'gsub'")
     progress(count)
     string.gsub("a", ".", t)
   end
-  checkerror("stack overflow", foo)
+  checkerror("Stack overflow", foo)
   print("\tfinal count: ", count)
 end
 
@@ -137,7 +142,7 @@ do  print("testing changes in C-stack limit")
   assert(debug.setcstacklimit(lowlimit) == alterlimit)
   -- usable limit is much lower, due to active calls
   local actuallow = check()
-  assert(actuallow < lowlimit - 30)
+  assert(actuallow < lowlimit)
   -- now, add 'lowlimit' extra slots, which should all be available
   assert(debug.setcstacklimit(lowlimit + lowlimit) == lowlimit)
   local lim2 <const> = check()

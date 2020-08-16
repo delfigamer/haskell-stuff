@@ -11,7 +11,6 @@ module Lua.Common (
     LuaIterator,
     LuaMetatype(..),
     LuaMetatypeWrapper(..),
-    LuaPure(..),
     LuaPush(..),
     LuaRef,
     LuaState,
@@ -63,7 +62,6 @@ module Lua.Common (
     luaConcat,
     luaCreateFunction,
     luaCreateNamedFunction,
-    luaCreatePureUserdata,
     luaCreateTable,
     luaCreateThread,
     luaCreateUserdata,
@@ -107,12 +105,14 @@ module Lua.Common (
     luaToInteger,
     luaToFunction,
     luaToNil,
-    luaToPureUserdata,
+    luaToNumber,
+    luaToNumber2,
     luaToRational,
     luaToString,
     luaToUserdata,
     luaTry,
     luaTypename,
+    luaWarn,
     luaWithErrHandler,
     luaWrite,
     luaXPCall,
@@ -231,7 +231,8 @@ luaCloseAfter
     -> LuaState q s t
     -> LuaState q s t
 luaCloseAfter a act = do
-    lxMetatable a (\x -> lxFinally (lmtClose x) act)
+    lxMetatable a (\x -> do
+        lxFinally act $ lmtClose x)
 
 
 luaCompareLt :: LuaValue q s -> LuaValue q s -> LuaState q s Bool
@@ -283,13 +284,6 @@ luaCreateNamedFunction modname name fn = do
         lsfLocals = []}
     let fn' args = lxLocalStack (lstackFrame:) $ fn args
     luaCreateFunction fn'
-
-
-luaCreatePureUserdata
-    :: LuaMetatype (LuaPure t)
-    => t
-    -> LuaState q s (LuaValue q s)
-luaCreatePureUserdata px = luaCreateUserdata (LuaPure px)
 
 
 luaCreateTable
@@ -544,18 +538,17 @@ luaResume
     -> LuaState q s (Either (LuaValue q s) [LuaValue q s])
 luaResume a args = do
     case a of
-        LThread _ thread -> lxResume thread (Right args)
+        LThread _ thread -> lxResume thread args
         _ -> lxError $ errWrongResume a
 
 
 luaRunIO
     :: (forall q . LuaState q RealWorld t)
     -> IO (Either String t)
-luaRunIO = luaRunT resolveST resolveIO resolveYield onError onPure
+luaRunIO = luaRunT resolveST resolveIO onError onPure
     where
     resolveST act = stToIO $ act
     resolveIO act = Just <$> act
-    resolveYield _ = return $ Left $ errWrongYield
     onError (LString msg)
         = return $ Left $ BSt.unpack msg
     onError _ = return $ Left $ "Unknown error"
@@ -565,11 +558,10 @@ luaRunIO = luaRunT resolveST resolveIO resolveYield onError onPure
 luaRunST
     :: (forall q . LuaState q s t)
     -> ST s (Either String t)
-luaRunST = luaRunT resolveST resolveIO resolveYield onError onPure
+luaRunST = luaRunT resolveST resolveIO onError onPure
     where
     resolveST act = act
     resolveIO _ = return $ Nothing
-    resolveYield _ = return $ Left $ errWrongYield
     onError (LString msg)
         = return $ Left $ BSt.unpack msg
     onError _ = return $ Left $ "Unknown error"
@@ -580,13 +572,12 @@ luaRunT
     :: (Monad m)
     => (forall a . ST s a -> m a)
     -> (forall a . IO a -> m (Maybe a))
-    -> (forall q . [LuaValue q s] -> m (Either (LuaValue q s) [LuaValue q s]))
     -> (forall q . LuaValue q s -> m u)
     -> (t -> m u)
     -> (forall q . LuaState q s t)
     -> m u
-luaRunT resolveST resolveIO resolveYield onError onPure act = do
-    lxRunT resolveST resolveIO resolveYield onError onPure (do
+luaRunT resolveST resolveIO onError onPure act = do
+    lxRunT resolveST resolveIO onError onPure (do
         tr <- lxTry act
         case tr of
             Left err -> do
@@ -751,14 +742,26 @@ luaToNil LNil = Just ()
 luaToNil _ = Nothing
 
 
-luaToPureUserdata
-    :: (Typeable u)
-    => LuaValue q s
-    -> Maybe u
-luaToPureUserdata a = do
-    case luaToUserdata a of
-        Just (LuaPure px) -> px
-        Nothing -> Nothing
+luaToNumber
+    :: LuaValue q s
+    -> a
+    -> (Integer -> a)
+    -> (Rational -> a)
+    -> (Double -> a)
+    -> a
+luaToNumber = lxToNumber
+
+
+luaToNumber2
+    :: LuaValue q s
+    -> LuaValue q s
+    -> a
+    -> a
+    -> (Integer -> Integer -> a)
+    -> (Rational -> Rational -> a)
+    -> (Double -> Double -> a)
+    -> a
+luaToNumber2 = lxToNumber2
 
 
 luaToRational :: LuaValue q s -> Maybe Rational
@@ -806,6 +809,12 @@ luaTypename
     :: LuaValue q s
     -> BSt.ByteString
 luaTypename = lvalTypename
+
+
+luaWarn
+    :: LuaValue q s
+    -> LuaState q s ()
+luaWarn = lxWarn
 
 
 luaWithErrHandler

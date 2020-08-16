@@ -7,7 +7,11 @@ local debug = require "debug"
 
 
 local function checkload (s, msg)
-  assert(string.find(select(2, load(s)), msg))
+  local err = select(2, load(s))
+  if not string.find(err, msg) then
+    print(err, msg)
+    assert(false)
+  end
 end
 
 -- testing semicollons
@@ -212,10 +216,10 @@ print'+';
 
 do   -- testing constants
   local prog <const> = [[local x <XXX> = 10]]
-  checkload(prog, "unknown attribute 'XXX'")
+  checkload(prog, "^[^:]*:1.*Unknown attribute <XXX>")
 
   checkload([[local xxx <const> = 20; xxx = 10]],
-             ":1: attempt to assign to const variable 'xxx'")
+             "^[^:]*:1:.*Cannot assign to an immutable variable xxx")
 
   checkload([[
     local xx;
@@ -225,12 +229,12 @@ do   -- testing constants
       local abc = xx + yyy + xxx;
       return function () return function () xxx = yyy end end
     end
-  ]], ":6: attempt to assign to const variable 'xxx'")
+  ]], "^[^:]*:6:.*Cannot assign to an immutable variable xxx")
 
   checkload([[
     local x <close> = nil
     x = io.open()
-  ]], ":2: attempt to assign to const variable 'x'")
+  ]], "^[^:]*:2:.*Cannot assign to an immutable variable x")
 end
 
 f = [[
