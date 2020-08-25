@@ -61,7 +61,7 @@ lpkRequire loaded searchers name = do
             LNil -> do
                 let namestr = fromMaybe (BSt.pack $ show name) $
                         luaToString name
-                luaError $ LString $ BSt.intercalate "\n" $
+                luaError $ LString $ BSt.concat $
                     ("Failed to load module " <> namestr <> ":"):reverse errs
             _ -> do
                 srets <- luaCall searcher [name]
@@ -94,8 +94,8 @@ lpkSearchPath name prefix path sep rep = do
     mfound <- trynames fnames
     case mfound of
         Nothing -> return $ Left $
-            BSt.intercalate "\n" $
-                map (\x -> "No file " <> BSt.pack (show x)) $
+            BSt.concat $
+                map (\x -> "\nNo file " <> BSt.pack (show x)) $
                     fnames
         Just r -> return $ Right r
     where

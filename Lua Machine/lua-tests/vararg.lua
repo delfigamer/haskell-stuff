@@ -36,8 +36,8 @@ assert(a == 55 and b == 2)
 a = call(c12, {1,2;n=1})
 assert(not a)
 assert(c12(1,2,3) == false)
-local a = vararg(call(next, {_G,nil;n=2}))
-local b,c = next(_G)
+local a = vararg(call(pairs(_G), {n=0}))
+local b,c = pairs(_G)()
 assert(a[1] == b and a[2] == c and a.n == 2)
 a = vararg(call(call, {c12, {1,2}}))
 assert(a.n == 2 and a[1] == 55 and a[2] == 2)
@@ -117,7 +117,7 @@ assert(f())
 a = {select(3, table.unpack{10,20,30,40})}
 assert(#a == 2 and a[1] == 30 and a[2] == 40)
 a = {select(1)}
-assert(next(a) == nil)
+assert(pairs(a)() == nil)
 a = {select(-1, 3, 5, 7)}
 assert(a[1] == 7 and a[2] == undef)
 a = {select(-2, 3, 5, 7)}

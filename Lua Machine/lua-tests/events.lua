@@ -75,7 +75,7 @@ a[1] = 10; a[2] = 20; a[3] = 90;
 for i = 4, 20 do a[i] = i * 10 end
 assert(a[1] == 10 and a[2] == 20 and a[3] == 90)
 for i = 4, 20 do assert(a[i] == i * 10) end
-assert(next(a) == nil)
+assert(pairs(a)() == nil)
 
 
 do
@@ -265,7 +265,7 @@ t.__lt = function (a,b)
     if not b[k] then return false end
     b[k] = undef
   end
-  return next(b) ~= nil
+  return pairs(b)() ~= nil
 end
 
 t.__le = function (a,b)
@@ -289,7 +289,7 @@ t.__eq = function (a,b)
     if not b[k] then return false end
     b[k] = undef
   end
-  return next(b) == nil
+  return pairs(b)() == nil
 end
 
 local s = Set{1,3,5}

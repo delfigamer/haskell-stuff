@@ -17,10 +17,7 @@ module Lua.Table (
 ) where
 
 import Prelude hiding (length)
-import Control.Exception
-import Control.Monad
 import Control.Monad.ST
-import Data.Function
 import Data.Hashable (Hashable)
 import Data.Maybe
 import Data.STRef
@@ -65,39 +62,44 @@ newtype Table s v = Table (STRef s (TableData s v))
 updateListPart
     :: (Nilable v)
     => TableData s v
-    -> ST s (V.STArray s Int v)
-updateListPart !(TableData len listPart hashPart) = do
+    -> ST s (TableData s v)
+updateListPart !table@(TableData listFill listPart hashPart) = do
     (_, oldcap) <- V.getBounds listPart
-    let descap = desiredCapacity oldcap
-    case assert (descap >= len) () of
-        _
-            | descap < oldcap -> do
-                newListPart <- V.mapIndices (1, descap) id listPart
-                forM_ [descap+1 .. oldcap] $ \i -> do
-                    value <- V.readArray listPart i
-                    if isNil value
-                        then return ()
-                        else H.insert hashPart (KInt i) value
-                return $! newListPart
-            | descap > oldcap -> do
-                newListPart <- V.newArray_ (1, descap)
-                forM_ [1 .. oldcap] $ \i -> do
-                    value <- V.readArray listPart i
-                    V.writeArray newListPart i value
-                forM_ [oldcap+1 .. descap] $ \i -> do
-                    value <- H.mutate hashPart (KInt i) $ \mvalue -> do
-                        (Nothing, fromMaybe nil mvalue)
-                    V.writeArray newListPart i value
-                return $! newListPart
-            | otherwise -> do
-                return $! listPart
+    let newcap = desiredCapacity oldcap
+    if newcap /= oldcap
+        then do
+            newListPart <- V.newArray_ (1, newcap)
+            let commoncap = min oldcap newcap
+            _ <- copyElems (0::Int) (commoncap+1) oldcap
+                (V.readArray listPart)
+                (\i x -> if isNil x
+                    then return ()
+                    else H.insert hashPart (KInt i) x)
+            counter1 <- copyElems 0 1 commoncap
+                (V.readArray listPart)
+                (V.writeArray newListPart)
+            counter2 <- copyElems counter1 (commoncap+1) newcap
+                (\i -> H.mutate hashPart (KInt i) $ \mvalue -> do
+                    (Nothing, fromMaybe nil mvalue))
+                (V.writeArray newListPart)
+            return $! TableData counter2 newListPart hashPart
+        else return $! table
     where
+    copyElems !counter !i !maxi reader writer
+        | i > maxi = return counter
+        | otherwise = do
+            value <- reader i
+            () <- writer i value
+            let counter2 = if isNil value
+                    then counter
+                    else counter + 1
+            copyElems counter2 (i+1) maxi reader writer
     desiredCapacity !capacity
-        -- when length < 1/4 capacity, shrink, until the lowest capacity of 4
-        | 4 < capacity && capacity > 4*len = do
+        {- when fill < 1/4 capacity, shrink, until the lowest capacity of 8 -}
+        | 8 < capacity && capacity > 4*listFill = do
             desiredCapacity $ capacity `div` 2
-        -- when length > 3/4 capacity, grow
-        | 4*len >= 3*capacity = do
+        {- when fill > 3/4 capacity, grow -}
+        | 4*listFill >= 3*capacity = do
             desiredCapacity $ capacity * 2
         | otherwise = do
             capacity
@@ -107,7 +109,7 @@ new
     :: (Nilable v)
     => ST s (Table s v)
 new = do
-    listPart <- V.newArray (1, 4) nil
+    listPart <- V.newArray (1, 8) nil
     hashPart <- H.new
     ptable <- newSTRef $! TableData 0 listPart hashPart
     return $! Table ptable
@@ -151,47 +153,20 @@ set (Table ptable) !key !value = do
         KInt i | 1 <= i -> do
             (_, cap) <- V.getBounds listPart
             if i <= cap
-                then if isNil value
-                    then deleteListItem i table
-                    else insertListItem i cap table
+                then setListItem i table
                 else setHashItem hashPart
         _ -> setHashItem hashPart
     where
-    insertListItem index oldcap (TableData oldlen oldListPart hashPart)
-        | index > oldlen = do
-            newlen <- flip fix index $ \loop !i -> do
-                let nexti = i + 1
-                if nexti <= oldcap
-                    then do
-                        nextval <- V.readArray oldListPart nexti
-                        if isNil nextval
-                            then return $ i
-                            else loop $ nexti
-                    else do
-                        mval <- H.lookup hashPart (KInt nexti)
-                        case mval of
-                            Nothing -> return $ i
-                            Just _ -> loop $ nexti
-            listPart <- updateListPart $ TableData newlen oldListPart hashPart
-            V.writeArray listPart index value
-            writeSTRef ptable $! TableData newlen listPart hashPart
-        | otherwise = do
-            V.writeArray oldListPart index value
-    deleteListItem index (TableData oldlen oldListPart hashPart)
-        | index <= oldlen = do
-            newlen <- flip fix (index-1) $ \loop !i -> do
-                if i > 0
-                    then do
-                        prevval <- V.readArray oldListPart i
-                        if isNil prevval
-                            then loop $ i-1
-                            else return $ i
-                    else return $ 0
-            listPart <- updateListPart $ TableData newlen oldListPart hashPart
-            V.writeArray listPart index nil
-            writeSTRef ptable $! TableData newlen listPart hashPart
-        | otherwise = do
-            V.writeArray oldListPart index nil
+    setListItem index table@(TableData listFill listPart hashPart) = do
+        oldvalue <- V.readArray listPart index
+        V.writeArray listPart index value
+        newtable <- case (isNil oldvalue, isNil value) of
+            (False, True) -> updateListPart $!
+                TableData (listFill-1) listPart hashPart
+            (True, False) -> updateListPart $!
+                TableData (listFill+1) listPart hashPart
+            _ -> return $! table
+        writeSTRef ptable $! newtable
     setHashItem hashPart = do
         if isNil value
             then H.delete hashPart key
@@ -199,11 +174,33 @@ set (Table ptable) !key !value = do
 
 
 length
-    :: Table s v
+    :: (Nilable v)
+    => Table s v
     -> ST s Int
 length (Table ptable) = do
-    TableData len _ _ <- readSTRef ptable
-    return $! len
+    table@(TableData _ listPart _) <- readSTRef ptable
+    (_, cap) <- V.getBounds listPart
+    upPhase table cap 0 1
+    where
+    upPhase table cap left right = do
+        rv <- geti table cap right
+        if isNil rv
+            then downPhase table cap left right
+            else if right < 0x40000000
+                then upPhase table cap right (right*2)
+                else downPhase table cap right (right*2-1)
+    downPhase table cap left right
+        | right - left <= 1 = return $ left
+        | otherwise = do
+            let mid = (right - left) `div` 2 + left
+            mv <- geti table cap mid
+            if isNil mv
+                then downPhase table cap left mid
+                else downPhase table cap mid right
+    geti (TableData _ listPart hashPart) cap index = do
+        if index <= cap
+            then V.readArray listPart index
+            else fromMaybe nil <$> H.lookup hashPart (KInt index)
 
 
 keys
@@ -220,83 +217,16 @@ keys (Table ptable) = do
     return $ map KInt [1..cap] ++ ks1
 
 
--- newtype Iterator s k v = Iterator
-    -- {step :: ST s (Maybe (k, v, Iterator s k v))}
-
-
--- ipairs
-    -- :: (Nilable v)
-    -- => Table s v
-    -- -> Iterator s Int v
--- ipairs (Table ptable) = do
-    -- Iterator (go 1)
-    -- where
-    -- go !index = do
-        -- TableData _ listPart hashPart <- readSTRef ptable
-        -- (_, cap) <- V.getBounds listPart
-        -- let !nexti = index+1
-        -- let !nextgo = Iterator $ go nexti
-        -- if index <= cap
-            -- then do
-                -- value <- V.readArray listPart index
-                -- if isNil value
-                    -- then return $! Nothing
-                    -- else return $! Just (index, value, nextgo)
-            -- else do
-                -- mvalue <- H.lookup hashPart (KInt index)
-                -- case mvalue of
-                    -- Nothing -> return $! Nothing
-                    -- Just !value -> return $! Just (index, value, nextgo)
-
-
--- pairs
-    -- :: (Nilable v)
-    -- => Table s v
-    -- -> Iterator s Key v
--- pairs (Table ptable) = do
-    -- Iterator (goList 1)
-    -- where
-    -- goList !index = do
-        -- TableData _ listPart _ <- readSTRef ptable
-        -- (_, cap) <- V.getBounds listPart
-        -- if index <= cap
-            -- then do
-                -- let !nexti = index+1
-                -- value <- V.readArray listPart index
-                -- if isNil value
-                    -- then goList nexti
-                    -- else do
-                        -- let !nextgo = Iterator $ goList nexti
-                        -- let !key = KInt index
-                        -- return $! Just (key, value, nextgo)
-            -- else walkList
-    -- walkList = do
-        -- TableData _ _ hashPart <- readSTRef ptable
-        -- keys <- H.foldM
-            -- (\ks (key, _) -> return $! key:ks)
-            -- []
-            -- hashPart
-        -- goKeys hashPart keys
-    -- goKeys hashPart !keys = do
-        -- case keys of
-            -- (!key):rest -> do
-                -- mvalue <- H.lookup hashPart key
-                -- case mvalue of
-                    -- Nothing -> goKeys hashPart rest
-                    -- Just !value -> do
-                        -- let !nextgo = Iterator $ goKeys hashPart rest
-                        -- return $! Just (key, value, nextgo)
-            -- [] -> return $! Nothing
-
-
 -- dump
     -- :: (Nilable v, Show v)
     -- => Table RealWorld v
     -- -> IO ()
 -- dump (Table ptable) = do
-    -- TableData len listPart hashPart <- stToIO $ readSTRef ptable
+    -- TableData listFill listPart hashPart <- stToIO $ readSTRef ptable
+    -- len <- stToIO $ length $ Table ptable
     -- putStrLn $ "Table"
     -- putStrLn $ "  length: " ++ show len
+    -- putStrLn $ "  fill: " ++ show listFill
     -- putStrLn $ "  listPart:"
     -- (minb, maxb) <- stToIO $ V.getBounds listPart
     -- putStrLn $ "    bounds: (" ++ show minb ++ ", " ++ show maxb ++ ")"
@@ -322,27 +252,42 @@ keys (Table ptable) = do
 
 -- tt :: IO (Table RealWorld String)
 -- tt = do
-    -- t <- stToIO $ do
-        -- t <- new
-        -- set t (KInt 3) "c"
-        -- set t (KInt 4) "d"
-        -- set t (KInt 10) "a"
-        -- set t (KInt 20) "b"
-        -- set t (KInt 60) "f"
-        -- set t (KInt 50) "e"
-        -- set t (KString "foo") "zzf"
-        -- set t (KString "bat") "zzb"
-        -- set t (KId 0) "x0"
-        -- set t (KId 1) "x1"
-        -- set t (KId 2) "x2"
-        -- return $ t
-    -- flip fix (pairs t) $ \loop iter -> do
-        -- out <- stToIO $ step iter
-        -- case out of
-            -- Just (key, value, next) -> do
-                -- putStrLn $ "[" ++ show key ++ "] -> " ++ show value
-                -- loop next
-            -- Nothing -> return ()
+    -- t <- stToIO $ new
+    -- dump t
+    -- stToIO $ set t (KInt 3) "c"
+    -- dump t
+    -- stToIO $ set t (KInt 4) "d"
+    -- dump t
+    -- stToIO $ set t (KInt 1) "a"
+    -- dump t
+    -- stToIO $ set t (KInt 2) "b"
+    -- dump t
+    -- stToIO $ set t (KInt 6) "f"
+    -- dump t
+    -- stToIO $ set t (KInt 10) "z"
+    -- dump t
+    -- stToIO $ set t (KInt 5) "e"
+    -- dump t
+    -- stToIO $ set t (KString "foo") "zzf"
+    -- dump t
+    -- stToIO $ set t (KString "bat") "zzb"
+    -- dump t
+    -- stToIO $ set t (KId 0) "x0"
+    -- dump t
+    -- stToIO $ set t (KId 1) "x1"
+    -- dump t
+    -- stToIO $ set t (KId 2) "x2"
+    -- dump t
+    -- stToIO $ set t (KInt 3) ""
+    -- dump t
+    -- stToIO $ set t (KInt 4) ""
+    -- dump t
+    -- stToIO $ set t (KInt 1) ""
+    -- dump t
+    -- stToIO $ set t (KInt 2) ""
+    -- dump t
+    -- stToIO $ set t (KInt 6) ""
+    -- dump t
     -- return $ t
 
 

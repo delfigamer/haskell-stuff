@@ -9,7 +9,6 @@ module Lua.String (
     luaBreakString,
     luaFormat,
     luaLexInteger,
-    luaLexNumber,
 ) where
 
 
@@ -1063,93 +1062,6 @@ luaBreakString skipStart source pattern pos = do
                 next
                     | epos == BSt.length source = []
                     | otherwise = walk matcher epos epos
-
-
-luaLexNumber :: BSt.ByteString -> LuaValue q s
-luaLexNumber buf = do
-    readStart $ BSt.unpack buf
-
-    where
-
-    readStart str = do
-        case str of
-            c:rest | '\9' <= c && c <= '\13' -> readStart rest
-            ' ':rest-> readStart rest
-            '-':rest -> readPrefix (-1) rest
-            '+':rest -> readPrefix 1 rest
-            rest -> readPrefix 1 rest
-
-    readPrefix sign str = do
-        case str of
-            '0':'x':rest -> readAbs sign 16 rest
-            '0':'X':rest -> readAbs sign 16 rest
-            rest -> readAbs sign 10 rest
-
-    readAbs sign base str = readInteger base str $ readFraction sign base
-
-    readFraction sign base ipart str = do
-        case str of
-            '.':rest -> readInteger base rest $
-                \i -> readExponent sign base ipart (Just i)
-            rest -> readExponent sign base ipart Nothing rest
-
-    readExponent sign base ipart fpart str = do
-        case (base, str) of
-            (10, 'e':rest) -> readExponentValue sign ipart fpart 10 rest
-            (10, 'E':rest) -> readExponentValue sign ipart fpart 10 rest
-            (16, 'p':rest) -> readExponentValue sign ipart fpart 2 rest
-            (16, 'P':rest) -> readExponentValue sign ipart fpart 2 rest
-            (_, rest) -> readEnd sign ipart fpart Nothing rest
-
-    readExponentValue sign ipart fpart ebase str = do
-        case str of
-            '+':rest -> readInteger 10 rest $
-                readExponentThen sign ipart fpart ebase True
-            '-':rest -> readInteger 10 rest $
-                readExponentThen sign ipart fpart ebase False
-            rest -> readInteger 10 rest $
-                readExponentThen sign ipart fpart ebase True
-
-    readExponentThen sign ipart fpart ebase esign (enum, _) str = do
-        if esign
-            then readEnd sign ipart fpart (Just (ebase^enum, 1)) str
-            else readEnd sign ipart fpart (Just (1, ebase^enum)) str
-
-    readEnd sign ipart@(inum, iden) fpart epart str = do
-        case str of
-            "" -> case (fpart, epart) of
-                (Just (_, 1), _) | iden == 1 -> LNil
-                (Nothing, _) | iden == 1 -> LNil
-                (Nothing, Nothing) ->
-                    LInteger $ sign * inum
-                (Just (fnum, fden), Nothing) ->
-                    LRational $ sign * (inum * fden + fnum) % fden
-                (Nothing, Just (enum, eden)) ->
-                    LRational $ sign * (inum * enum) % eden
-                (Just (fnum, fden), Just (enum, eden)) ->
-                    LRational $ sign *
-                        ((inum * fden + fnum) * enum) % (fden * eden)
-            c:rest | '\9' <= c && c <= '\13' ->
-                readEnd sign ipart fpart epart rest
-            ' ':rest -> readEnd sign ipart fpart epart rest
-            _ -> LNil
-
-    readInteger base str cont = do
-        readIntegerNext base (0, 1) str cont
-
-    readIntegerNext base (num, den) str cont = do
-        case str of
-            c:rest
-                | '0' <= c && c <= '9' -> do
-                    let d = toInteger $ fromEnum c - fromEnum '0'
-                    readIntegerNext base (num*base + d, den*base) rest cont
-                | base == 16 && 'a' <= c && c <= 'f' -> do
-                    let d = toInteger $ fromEnum c - (fromEnum 'a' - 10)
-                    readIntegerNext base (num*base + d, den*base) rest cont
-                | base == 16 && 'A' <= c && c <= 'F' -> do
-                    let d = toInteger $ fromEnum c - (fromEnum 'A' - 10)
-                    readIntegerNext base (num*base + d, den*base) rest cont
-            rest -> cont (num, den) rest
 
 
 luaLexInteger :: BSt.ByteString -> Integer -> LuaValue q s

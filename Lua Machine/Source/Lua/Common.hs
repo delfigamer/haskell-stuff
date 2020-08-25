@@ -14,11 +14,14 @@ module Lua.Common (
     LuaPush(..),
     LuaRef,
     LuaState,
+    LuaThread,
     LuaValue(..),
     errArgRange,
     errArgType,
     errDivideZero,
+    errLenType,
     errNilIndex,
+    errNoArg,
     errNonSuspended,
     errWrongArith1,
     errWrongArith2,
@@ -65,13 +68,16 @@ module Lua.Common (
     luaCreateTable,
     luaCreateThread,
     luaCreateUserdata,
+    luaCurrentThread,
     luaError,
     luaExtend,
     luaFromUserdata,
     luaGet,
     luaGetMetatable,
     luaIsNumber,
+    luaIsYieldable,
     luaLen,
+    luaLexNumber,
     luaLiftIO,
     luaLiftST,
     luaNewTable,
@@ -99,6 +105,7 @@ module Lua.Common (
     luaSetTableMetatype,
     luaSetThreadMetatype,
     luaSetWarnHandler,
+    luaThreadClose,
     luaThreadState,
     luaToBoolean,
     luaToDouble,
@@ -109,6 +116,7 @@ module Lua.Common (
     luaToNumber2,
     luaToRational,
     luaToString,
+    luaToThread,
     luaToUserdata,
     luaTry,
     luaTypename,
@@ -121,6 +129,7 @@ module Lua.Common (
 ) where
 
 
+import Control.Monad
 import Control.Monad.ST
 import Data.Bits
 import Data.Ratio
@@ -249,7 +258,7 @@ luaCompareLe a b = lxPerformBinary
 
 luaCompareEq :: LuaValue q s -> LuaValue q s -> LuaState q s Bool
 luaCompareEq a b = lxPerformBinary
-    lxRawCompareEq lmtLe a b $
+    lxRawCompareEq lmtEq a b $
         return $ False
 
 
@@ -299,9 +308,7 @@ luaCreateThread
     :: LuaFunction q s
     -> LuaState q s (LuaValue q s)
 luaCreateThread f = do
-    i <- lxNewId
-    th <- lxNewThread f
-    return $ LThread i th
+    lxNewThread f
 
 
 luaCreateUserdata
@@ -311,6 +318,11 @@ luaCreateUserdata
 luaCreateUserdata x = do
     i <- lxNewId
     return $ LUserdata i x
+
+
+luaCurrentThread
+    :: LuaState q s (LuaValue q s, Bool)
+luaCurrentThread = lxCurrentThread
 
 
 luaError :: LuaValue q s -> LuaState q s a
@@ -354,6 +366,12 @@ luaIsNumber a = do
         _ -> False
 
 
+luaIsYieldable
+    :: LuaThread q s
+    -> LuaState q s Bool
+luaIsYieldable = lxIsYieldable
+
+
 luaLen
     :: LuaValue q s
     -> LuaState q s (LuaValue q s)
@@ -364,6 +382,82 @@ luaLen a = do
             case a of
                 LTable _ table -> LInteger <$> lxTableLength table
                 _ -> lxError $ errWrongLen a)
+
+
+luaLexNumber :: BSt.ByteString -> LuaValue q s
+luaLexNumber buf = do
+    readStart $ BSt.unpack buf
+    where
+    readStart str = do
+        case str of
+            c:rest | '\9' <= c && c <= '\13' -> readStart rest
+            ' ':rest-> readStart rest
+            '-':rest -> readPrefix (-1) rest
+            '+':rest -> readPrefix 1 rest
+            rest -> readPrefix 1 rest
+    readPrefix sign str = do
+        case str of
+            '0':'x':rest -> readAbs sign 16 rest
+            '0':'X':rest -> readAbs sign 16 rest
+            rest -> readAbs sign 10 rest
+    readAbs sign base str = readInteger base str $ readFraction sign base
+    readFraction sign base ipart str = do
+        case str of
+            '.':rest -> readInteger base rest $
+                \i -> readExponent sign base ipart (Just i)
+            rest -> readExponent sign base ipart Nothing rest
+    readExponent sign base ipart fpart str = do
+        case (base, str) of
+            (10, 'e':rest) -> readExponentValue sign ipart fpart 10 rest
+            (10, 'E':rest) -> readExponentValue sign ipart fpart 10 rest
+            (16, 'p':rest) -> readExponentValue sign ipart fpart 2 rest
+            (16, 'P':rest) -> readExponentValue sign ipart fpart 2 rest
+            (_, rest) -> readEnd sign ipart fpart Nothing rest
+    readExponentValue sign ipart fpart ebase str = do
+        case str of
+            '+':rest -> readInteger 10 rest $
+                readExponentThen sign ipart fpart ebase True
+            '-':rest -> readInteger 10 rest $
+                readExponentThen sign ipart fpart ebase False
+            rest -> readInteger 10 rest $
+                readExponentThen sign ipart fpart ebase True
+    readExponentThen sign ipart fpart ebase esign (enum, _) str = do
+        if esign
+            then readEnd sign ipart fpart (Just (ebase^enum, 1)) str
+            else readEnd sign ipart fpart (Just (1, ebase^enum)) str
+    readEnd sign ipart@(inum, iden) fpart epart str = do
+        case str of
+            "" -> case (fpart, epart) of
+                (Just (_, 1), _) | iden == 1 -> LNil
+                (Nothing, _) | iden == 1 -> LNil
+                (Nothing, Nothing) ->
+                    LInteger $ sign * inum
+                (Just (fnum, fden), Nothing) ->
+                    LRational $ sign * (inum * fden + fnum) % fden
+                (Nothing, Just (enum, eden)) ->
+                    LRational $ sign * (inum * enum) % eden
+                (Just (fnum, fden), Just (enum, eden)) ->
+                    LRational $ sign *
+                        ((inum * fden + fnum) * enum) % (fden * eden)
+            c:rest | '\9' <= c && c <= '\13' ->
+                readEnd sign ipart fpart epart rest
+            ' ':rest -> readEnd sign ipart fpart epart rest
+            _ -> LNil
+    readInteger base str cont = do
+        readIntegerNext base (0, 1) str cont
+    readIntegerNext base (num, den) str cont = do
+        case str of
+            c:rest
+                | '0' <= c && c <= '9' -> do
+                    let d = toInteger $ fromEnum c - fromEnum '0'
+                    readIntegerNext base (num*base + d, den*base) rest cont
+                | base == 16 && 'a' <= c && c <= 'f' -> do
+                    let d = toInteger $ fromEnum c - (fromEnum 'a' - 10)
+                    readIntegerNext base (num*base + d, den*base) rest cont
+                | base == 16 && 'A' <= c && c <= 'F' -> do
+                    let d = toInteger $ fromEnum c - (fromEnum 'A' - 10)
+                    readIntegerNext base (num*base + d, den*base) rest cont
+            rest -> cont (num, den) rest
 
 
 luaLiftIO
@@ -453,35 +547,67 @@ luaRangeIter
     -> LuaValue q s
     -> LuaState q s (LuaValue q s)
 luaRangeIter a b c = do
-    case (a, c) of
-        (LInteger start, LInteger step) -> do
-            ratlimit <- maybe err return $ luaToRational b
-            let limit = if step > 0
-                    then floor ratlimit
-                    else ceiling ratlimit
-            iterFunc start limit step
-        _ -> do
-            start <- maybe err return $ luaToRational a
-            limit <- maybe err return $ luaToRational b
-            step <- maybe err return $ luaToRational c
-            iterFunc start limit step
+    luaToNumber2 a c
+        (lxError $ errWrongRangeIter)
+        (lxError $ errWrongRangeIter)
+        onInteger
+        onRational
+        onDouble
     where
-    err = lxError $ errWrongRangeIter
-    iterCond limit step
-        | step == 0 = lxError $ errZeroStep
-        | step > 0 = return $ (<= limit)
-        | otherwise = return $ (>= limit)
-    iterFunc start limit step = do
-        cond <- iterCond limit step
-        pref <- lxAlloc start
-        let func _ = do
-            param <- lxRead pref
+    onInteger start step = do
+        when (step == 0) $ lxError $ errZeroStep
+        cond <- luaToNumber b
+            (lxError $ errWrongRangeIter)
+            (\bi -> do
+                return $ \i -> comparer step i bi)
+            (\bq -> do
+                return $ \i -> comparer step (toRational i) bq)
+            (\bd -> do
+                if isNaN bd || isInfinite bd
+                    then return $ \_ -> comparer step 0 bd
+                    else do
+                        let bq = toRational bd
+                        return $ \i -> comparer step (toRational i) bq)
+        iterFunc start step cond
+    onRational start step = do
+        when (step == 0) $ lxError $ errZeroStep
+        cond <- luaToNumber b
+            (lxError $ errWrongRangeIter)
+            (\bi -> do
+                let bq = fromInteger bi
+                return $ \q -> comparer step q bq)
+            (\bq -> return $ \q -> comparer step q bq)
+            (\bd -> do
+                if isNaN bd || isInfinite bd
+                    then return $ \_ -> comparer step 0 bd
+                    else do
+                        let bq = toRational bd
+                        return $ \q -> comparer step q bq)
+        iterFunc start step cond
+    onDouble start step = do
+        when (step == 0) $ lxError $ errZeroStep
+        cond <- luaToNumber b
+            (lxError $ errWrongRangeIter)
+            (\bi -> do
+                let bd = fromInteger bi
+                return $ \d -> comparer step d bd)
+            (\bq -> do
+                let bd = fromRational bq
+                return $ \d -> comparer step d bd)
+            (\bd -> return $ \d -> comparer step d bd)
+        iterFunc start step cond
+    comparer step
+        | step > 0 = (<=)
+        | otherwise = (>=)
+    iterFunc start step cond = do
+        pvalue <- lxAlloc start
+        luaCreateFunction $ \_ -> do
+            param <- lxRead pvalue
             if cond param
                 then do
-                    lxWrite pref (param + step)
+                    lxWrite pvalue $ param + step
                     return $ [luaPush param]
                 else return $ [LNil]
-        luaCreateFunction func
 
 
 luaRawEqual
@@ -533,57 +659,55 @@ luaRead = lxRead
 
 
 luaResume
-    :: LuaValue q s
+    :: LuaThread q s
     -> [LuaValue q s]
     -> LuaState q s (Either (LuaValue q s) [LuaValue q s])
-luaResume a args = do
-    case a of
-        LThread _ thread -> lxResume thread args
-        _ -> lxError $ errWrongResume a
+luaResume = lxResume
 
 
 luaRunIO
     :: (forall q . LuaState q RealWorld t)
     -> IO (Either String t)
-luaRunIO = luaRunT resolveST resolveIO onError onPure
-    where
-    resolveST act = stToIO $ act
-    resolveIO act = Just <$> act
-    onError (LString msg)
-        = return $ Left $ BSt.unpack msg
-    onError _ = return $ Left $ "Unknown error"
-    onPure x = return $ Right $ x
+luaRunIO = do
+    luaRunT
+        (\st cont -> stToIO st >>= cont)
+        (\io cont -> Just <$> io >>= cont)
+        (return . Left)
+        (return . Right)
 
 
 luaRunST
     :: (forall q . LuaState q s t)
     -> ST s (Either String t)
-luaRunST = luaRunT resolveST resolveIO onError onPure
-    where
-    resolveST act = act
-    resolveIO _ = return $ Nothing
-    onError (LString msg)
-        = return $ Left $ BSt.unpack msg
-    onError _ = return $ Left $ "Unknown error"
-    onPure x = return $ Right $ x
+luaRunST = do
+    luaRunT
+        (\st cont -> st >>= cont)
+        (\_ cont -> cont Nothing)
+        (return . Left)
+        (return . Right)
 
 
 luaRunT
-    :: (Monad m)
-    => (forall a . ST s a -> m a)
-    -> (forall a . IO a -> m (Maybe a))
-    -> (forall q . LuaValue q s -> m u)
-    -> (t -> m u)
+    :: (forall u . ST s u -> (u -> r) -> r)
+    -> (forall u . IO u -> (Maybe u -> r) -> r)
+    -> (String -> r)
+    -> (t -> r)
     -> (forall q . LuaState q s t)
-    -> m u
-luaRunT resolveST resolveIO onError onPure act = do
-    lxRunT resolveST resolveIO onError onPure (do
-        tr <- lxTry act
-        case tr of
-            Left err -> do
-                msg <- luaAsString err
-                luaError $ LString msg
-            Right x -> return $ x)
+    -> r
+luaRunT onST onIO onError onPure act = do
+    lxRunT
+        onST
+        onIO
+        (\err -> case err of
+            LString msg -> onError $ BSt.unpack msg
+            _ -> onError $ "Unknown error")
+        onPure $ do
+            tr <- lxTry act
+            case tr of
+                Left err -> do
+                    msg <- luaAsString err
+                    lxError $ LString msg
+                Right x -> return $ x
 
 
 luaSet
@@ -687,17 +811,20 @@ luaSetWarnHandler
 luaSetWarnHandler = lxSetWarnHandler
 
 
+luaThreadClose
+    :: LuaThread q s
+    -> LuaState q s (Maybe (LuaValue q s))
+luaThreadClose = lxThreadClose
+
+
 luaThreadState
-    :: LuaValue q s
+    :: LuaThread q s
     -> LuaState q s t
     -> LuaState q s t
     -> LuaState q s t
     -> LuaState q s t
     -> LuaState q s t
-luaThreadState a onRunning onSuspended onNormal onDead = do
-    case a of
-        LThread _ th -> lxThreadState th onRunning onSuspended onNormal onDead
-        _ -> luaError $ errWrongThreadStatus a
+luaThreadState = lxThreadState
 
 
 luaToBoolean
@@ -709,23 +836,26 @@ luaToBoolean _ = True
 
 
 luaToDouble :: LuaValue q s -> Maybe Double
-luaToDouble (LInteger x) = Just $ fromInteger x
-luaToDouble (LRational x) = Just $ fromRational x
-luaToDouble (LDouble x) = Just $ x
-luaToDouble _ = Nothing
+luaToDouble a = luaToNumber a
+    Nothing
+    (Just . fromInteger)
+    (Just . fromRational)
+    Just
 
 
 luaToInteger :: LuaValue q s -> Maybe Integer
-luaToInteger (LInteger x) = Just x
-luaToInteger (LRational x) =
-    if denominator x == 1
-        then Just $ numerator x
-        else Nothing
-luaToInteger (LDouble x) =
-    if isNaN x || isInfinite x
-        then Nothing
-        else luaToInteger $ LRational $ toRational x
-luaToInteger _ = Nothing
+luaToInteger a = luaToNumber a
+    Nothing
+    Just
+    (\q -> if denominator q == 1
+        then Just $ numerator q
+        else Nothing)
+    (\d -> do
+        if isInfinite d || isNaN d
+            then Nothing
+            else case toRational d of
+                q | denominator q == 1 -> Just $ numerator q
+                _ -> Nothing)
 
 
 luaToFunction
@@ -749,7 +879,17 @@ luaToNumber
     -> (Rational -> a)
     -> (Double -> a)
     -> a
-luaToNumber = lxToNumber
+luaToNumber a onOther onInteger onRational onDouble = do
+    case a of
+        LInteger i -> onInteger i
+        LRational q -> onRational q
+        LDouble d -> onDouble d
+        LString s -> case luaLexNumber s of
+            LInteger i -> onInteger i
+            LRational q -> onRational q
+            LDouble d -> onDouble d
+            _ -> onOther
+        _ -> onOther
 
 
 luaToNumber2
@@ -761,17 +901,35 @@ luaToNumber2
     -> (Rational -> Rational -> a)
     -> (Double -> Double -> a)
     -> a
-luaToNumber2 = lxToNumber2
+luaToNumber2 a b onOtherA onOtherB onInteger2 onRational2 onDouble2 = do
+    luaToNumber a
+        onOtherA
+        (\ia -> luaToNumber b
+            onOtherB
+            (\ib -> onInteger2 ia ib)
+            (\qb -> onRational2 (fromInteger ia) qb)
+            (\db -> onDouble2 (fromInteger ia) db))
+        (\qa -> luaToNumber b
+            onOtherB
+            (\ib -> onRational2 qa (fromInteger ib))
+            (\qb -> onRational2 qa qb)
+            (\db -> onDouble2 (fromRational qa) db))
+        (\da -> luaToNumber b
+            onOtherB
+            (\ib -> onDouble2 da (fromInteger ib))
+            (\qb -> onDouble2 da (fromRational qb))
+            (\db -> onDouble2 da db))
 
 
 luaToRational :: LuaValue q s -> Maybe Rational
-luaToRational (LInteger x) = Just $ fromInteger x
-luaToRational (LRational x) = Just $ x
-luaToRational (LDouble x) =
-    if isNaN x || isInfinite x
-        then Nothing
-        else Just $ toRational x
-luaToRational _ = Nothing
+luaToRational a = luaToNumber a
+    Nothing
+    (Just . fromInteger)
+    Just
+    (\d -> do
+        if isInfinite d || isNaN d
+            then Nothing
+            else Just $ toRational d)
 
 
 luaToString
@@ -782,6 +940,13 @@ luaToString x@(LRational _) = Just $ BSt.pack $ show x
 luaToString x@(LDouble _) = Just $ BSt.pack $ show x
 luaToString (LString b) = Just $ b
 luaToString _ = Nothing
+
+
+luaToThread
+    :: LuaValue q s
+    -> Maybe (LuaThread q s)
+luaToThread (LThread _ th) = Just th
+luaToThread _ = Nothing
 
 
 luaToUserdata

@@ -4,10 +4,13 @@
 print('testing tables, next, and for')
 
 local function checkerror (msg, f, ...)
-  local s, err = pcall(f, ...)
-  assert(not s and string.find(err, msg))
+  local s, err = xpcall(f, nil, ...)
+  assert(not s)
+  if not string.find(err, msg) then
+    print(err, msg)
+    assert(false)
+  end
 end
-
 
 local a = {}
 
@@ -206,12 +209,13 @@ a,b,c = nil
 
 
 -- next uses always the same iteraction function
-assert(next{} == next{})
+-- assert(next{} == next{})
 
 local function find (name)
   local n,v
+  local iter = pairs(_G)
   while 1 do
-    n,v = next(_G, n)
+    n,v = iter()
     if not n then return nofind end
     assert(_G[n] ~= undef)
     if n == name then return v end
@@ -237,11 +241,11 @@ _G["xxx"] = 1
 assert(xxx==find("xxx"))
 
 -- invalid key to 'next'
-checkerror("invalid key", next, {10,20}, 3)
+-- checkerror("invalid key", next, {10,20}, 3)
 
 -- both 'pairs' and 'ipairs' need an argument
-checkerror("bad argument", pairs)
-checkerror("bad argument", ipairs)
+checkerror("Expected a table at argument 1, got a nil", pairs)
+checkerror("Expected a table at argument 1, got a nil", ipairs)
 
 print('+')
 
@@ -277,7 +281,12 @@ end
 
 local function checknext (a)
   local b = {}
-  do local k,v = next(a); while k do b[k] = v; k,v = next(a,k) end end
+  -- do local k,v = next(a); while k do b[k] = v; k,v = next(a,k) end end
+  do
+    local iter = pairs(a)
+    local k,v = iter()
+    while k do b[k] = v; k,v = iter() end
+  end
   for k,v in pairs(b) do assert(a[k] == v) end
   for k,v in pairs(a) do assert(b[k] == v) end
 end
@@ -331,14 +340,14 @@ do    -- testing 'next' with all kinds of keys
     [checkerror] = 6,               -- Lua function
     [coroutine.running()] = 7,      -- thread
     [true] = 8,                     -- boolean
-    [io.stdin] = 9,                 -- userdata
+    [os.time()] = 9,                -- userdata
     [{}] = 10,                      -- table
   }
   local b = {}; for i = 1, 10 do b[i] = true end
   for k, v in pairs(a) do
     assert(b[v]); b[v] = undef
   end
-  assert(next(b) == nil)        -- 'b' now is empty
+  assert(pairs(b)() == nil)        -- 'b' now is empty
 end
 
 
@@ -507,10 +516,13 @@ a = {}
 for i=1,1000 do
   a[i] = i; a[i - 1] = undef
 end
-assert(next(a,nil) == 1000 and next(a,1000) == nil)
+do
+  local iter = pairs(a)
+  assert(iter() == 1000)
+  assert(iter() == nil)
+end
 
-assert(next({}) == nil)
-assert(next({}, nil) == nil)
+assert(pairs({})() == nil)
 
 for a,b in pairs{} do error"not here" end
 for i=1,0 do error'not here' end
@@ -604,11 +616,16 @@ end
 
 do   -- testing other strange cases for numeric 'for'
 
-  local function checkfor (from, to, step, t)
+  local function checkfor (from, to, step, t, inf)
     local c = 0
     for i = from, to, step do
       c = c + 1
-      assert(i == t[c])
+      if t[c] then
+        assert(i == t[c])
+      else
+        assert(inf)
+        return
+      end
     end
     assert(c == #t)
   end
@@ -618,13 +635,13 @@ do   -- testing other strange cases for numeric 'for'
 
   checkfor(mini, maxi, maxi, {mini, -1, maxi - 1})
 
-  checkfor(mini, math.huge, maxi, {mini, -1, maxi - 1})
+  checkfor(mini, math.huge, maxi, {mini, -1, maxi - 1}, true)
 
   checkfor(maxi, mini, mini, {maxi, -1})
 
   checkfor(maxi, mini, -maxi, {maxi, 0, -maxi})
 
-  checkfor(maxi, -math.huge, mini, {maxi, -1})
+  checkfor(maxi, -math.huge, mini, {maxi, -1}, true)
 
   checkfor(maxi, mini, 1, {})
   checkfor(mini, maxi, -1, {})
@@ -652,15 +669,15 @@ do   -- testing other strange cases for numeric 'for'
 end
 
 
-checkerror("'for' step is zero", function ()
+checkerror("Attempt to perform a ranged for loop with step zero", function ()
   for i = 1, 10, 0 do end
 end)
 
-checkerror("'for' step is zero", function ()
+checkerror("Attempt to perform a ranged for loop with step zero", function ()
   for i = 1, -10, 0 do end
 end)
 
-checkerror("'for' step is zero", function ()
+checkerror("Attempt to perform a ranged for loop with step zero", function ()
   for i = 1.0, -10, 0.0 do end
 end)
 
@@ -688,12 +705,11 @@ end
 assert(x == 5)
 
 
-
 -- testing __pairs and __ipairs metamethod
 a = {}
 do
   local x,y,z = pairs(a)
-  assert(type(x) == 'function' and y == a and z == nil)
+  assert(type(x) == 'function' and y == nil and z == nil)
 end
 
 local function foo (e,i)
@@ -714,6 +730,7 @@ for k,v in pairs(a) do
   i = i + 1
   assert(k == i and v == k+1)
 end
+assert(i==11)
 
 a.n = 5
 a[3] = 30

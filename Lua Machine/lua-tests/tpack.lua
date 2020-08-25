@@ -37,7 +37,6 @@ print("\talignment: " .. align)
 -- check errors in arguments
 function checkerror (msg, f, ...)
   local status, err = pcall(f, ...)
-  -- print(status, err, msg)
   assert(not status)
 end
 
@@ -53,7 +52,6 @@ assert(unpack("h", pack("h", -0x8000)) == -0x8000)
 assert(unpack("L", pack("L", 0xffffffff)) == 0xffffffff)
 assert(unpack("l", pack("l", 0x7fffffff)) == 0x7fffffff)
 assert(unpack("l", pack("l", -0x80000000)) == -0x80000000)
-
 
 for i = 1, NB do
   -- small numbers with signal extension ("\xFF...")
@@ -112,7 +110,6 @@ end
 do
   assert(pack(">i2 <i2", 10, 20) == "\0\10\20\0")
   local a, b = unpack("<i2 >i2", "\10\0\0\20")
-  print(a, b)
   assert(a == 10 and b == 20)
   assert(pack("=i4", 2001) == pack("i4", 2001))
 end

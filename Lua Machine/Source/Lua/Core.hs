@@ -16,12 +16,15 @@ module Lua.Core (
     LuaStackFrame(..),
     LuaState,
     LuaTable(..),
+    LuaThread,
     LuaValue(..),
     LuaVariableList,
     errArgRange,
     errArgType,
     errDivideZero,
+    errLenType,
     errNilIndex,
+    errNoArg,
     errNonSuspended,
     errWrongArith1,
     errWrongArith2,
@@ -48,12 +51,14 @@ module Lua.Core (
     lxAskStack,
     lxCall,
     lxCar,
+    lxCurrentThread,
     lxDefaultMetatable,
     lxError,
     lxExtend,
     lxFinally,
     lxGet,
     lxGetDebugHook,
+    lxIsYieldable,
     lxLiftST,
     lxLocalStack,
     lxMetatable,
@@ -94,6 +99,7 @@ module Lua.Core (
     lxTableLength,
     lxTableNext,
     lxTableSet,
+    lxThreadClose,
     lxThreadState,
     lxToNumber,
     lxToNumber2,
@@ -125,7 +131,6 @@ errArgRange
 errArgRange n = LString $ BSt.concat [
         "Argument ", BSt.pack (show n), " is out of range"]
 
-
 errArgType
     :: Int
     -> BSt.ByteString
@@ -136,12 +141,23 @@ errArgType n expected value = LString $ BSt.concat [
         BSt.pack (show n),
         ", got a ", lvalTypename value]
 
-
 errDivideZero :: LuaValue q s
-errDivideZero = LString $ "Attempt to divide by zero"
+errDivideZero = LString $ "Divide by zero"
+
+errLenType :: LuaValue q s
+errLenType = LString "Object length is not an integer"
 
 errNilIndex :: LuaValue q s
 errNilIndex = LString $ "Attempt to index a table with a nil"
+
+errNoArg
+    :: Int
+    -> BSt.ByteString
+    -> LuaValue q s
+errNoArg n expected = LString $ BSt.concat [
+        "Expected a ", expected, " at argument ",
+        BSt.pack (show n),
+        ", got nothing"]
 
 errNonSuspended :: LuaValue q s
 errNonSuspended = LString $ "Attempt to resume a non-suspended coroutine"
@@ -209,6 +225,11 @@ errWrongTable :: LuaValue q s -> LuaValue q s
 errWrongTable a
     = LString $ BSt.concat [
         "Attempt to index a ", lvalTypename a]
+
+errWrongThreadClose :: LuaValue q s
+errWrongThreadClose
+    = LString $ BSt.concat [
+        "Attempt to close an active coroutine"]
 
 errWrongThreadFunc :: LuaValue q s -> LuaValue q s
 errWrongThreadFunc a
@@ -339,7 +360,7 @@ iimtMetaopUnary !metaname !self def = do
     (value, metaop) <- iimtParse metaname self
     case metaop of
         LNil -> def
-        f -> lxCar <$> lxCall f [value]
+        f -> lxCar <$> lxCall f [value, value]
 
 
 iimtMetaopBinary
@@ -405,13 +426,13 @@ instance LuaMetatype LuaAnnotated where
         case metaop of
             LNil -> def
             LFunction _ ff -> lxCar <$> ff [value, index]
-            next -> lxGet next index
+            next -> lxStackLevel $ lxGet next index
     lmtNewIndex !self !index !new def = do
         (value, metaop) <- iimtParse "__newindex" self
         case metaop of
             LNil -> def
             LFunction _ ff -> () <$ ff [value, index, new]
-            next -> lxSet next index new
+            next -> lxStackLevel $ lxSet next index new
     lmtCall !self args def = do
         (value, metaop) <- iimtParse "__call" self
         case metaop of
@@ -426,8 +447,8 @@ instance LuaMetatype LuaAnnotated where
         (value, metaop) <- iimtParse "__tostring" self
         case metaop of
             LNil -> def
-            LFunction _ ff -> lxAsString . lxCar =<< ff [value]
-            next -> lxAsString next
+            LFunction _ ff -> lxStackLevel . lxAsString . lxCar =<< ff [value]
+            next -> lxStackLevel $ lxAsString next
 
 
 newtype LuaUnannotated q s = LuaUnannotated (LuaValue q s)
@@ -453,21 +474,47 @@ instance T.Nilable (LuaValue q s, LuaValue q s) where
 type LuaFunction q s = [LuaValue q s] -> LuaState q s [LuaValue q s]
 
 
+newtype LuaCloseChain q s =
+    LuaCloseChain
+        (  Maybe (LuaValue q s)
+        -> LuaCoroutine q s (Maybe (LuaValue q s)))
+
+
+instance Semigroup (LuaCloseChain q s) where
+    LuaCloseChain a <> LuaCloseChain b = LuaCloseChain $ \x -> a x >>= b
+
+
+instance Monoid (LuaCloseChain q s) where
+    mempty = LuaCloseChain $ pure
+
+
+type LuaCoroutine q s =
+    Y.Coroutine
+        [LuaValue q s]
+        (LuaCloseChain q s, [LuaValue q s])
+        (LuaValue q s)
+        q
+        (LuaLifted s)
+
+
+type LuaSuspend q s =
+    Y.Suspend
+        [LuaValue q s]
+        (LuaCloseChain q s, [LuaValue q s])
+        (LuaValue q s)
+        q
+
+
 data LuaThreadState q s
-    = LTRunning
+    = LTRunning !Bool
     | LTSuspended
-        (  [LuaValue q s]
-        -> Y.Thread
-            [LuaValue q s]
-            [LuaValue q s]
-            (LuaValue q s)
-            (LuaLifted s)
-            [LuaValue q s])
-    | LTNormal
+        (LuaCloseChain q s)
+        (LuaSuspend q s)
+    | LTNormal !Bool
     | LTDead
 
 
-type LuaThread q s = LuaRef q s (LuaThreadState q s)
+newtype LuaThread q s = LuaThread (LuaRef q s (LuaThreadState q s))
 
 
 data LuaValue q s where
@@ -660,7 +707,7 @@ type LuaErrorHandler q s = LuaValue q s -> LuaState q s (LuaValue q s)
 
 type LuaVariableList q s = [(
     Maybe (SourceRange, BSt.ByteString),
-    Either (LuaValue q s) (LuaRef q s (LuaValue q s)))]
+    LuaRef q s (LuaValue q s))]
 
 
 data LuaStackFrame q s = LuaStackFrame {
@@ -680,11 +727,11 @@ lsfModifyLocals f (LuaStackFrame d c u l)
 
 data LuaContext q s = LuaContext {
     lctxEnvironment :: !(LuaEnvironment q s),
-    lctxYieldable :: !Bool,
     lctxErrHandler :: LuaErrorHandler q s,
-    lctxCurrentThread :: LuaThread q s,
+    lctxCurrentThread :: LuaValue q s,
     lctxStack :: ![LuaStackFrame q s],
-    lctxStackInnerDepth :: !Int}
+    lctxStackInnerDepth :: !Int,
+    lctxOnClose :: !(LuaCloseChain q s)}
 
 
 lctxModifyStack
@@ -703,14 +750,7 @@ data LuaLifted s t where
     LuaLiftedIO :: IO t -> LuaLifted s (Maybe t)
 
 
-newtype LuaState q s t = LuaState
-    (  LuaContext q s
-    -> Y.CoroutineT
-        [LuaValue q s]
-        [LuaValue q s]
-        (LuaValue q s)
-        (LuaLifted s)
-        t)
+newtype LuaState q s t = LuaState (LuaContext q s -> LuaCoroutine q s t)
 
 
 instance Functor (LuaState q s) where
@@ -735,41 +775,42 @@ instance Monad (LuaState q s) where
 
 
 lxRunT
-    :: (Monad m)
-    => (forall a . ST s a -> m a)
-    -> (forall a . IO a -> m (Maybe a))
-    -> (forall q . LuaValue q s -> m u)
-    -> (t -> m u)
+    :: (forall u . ST s u -> (u -> r) -> r)
+    -> (forall u . IO u -> (Maybe u -> r) -> r)
+    -> (forall q . LuaValue q s -> r)
+    -> (t -> r)
     -> (forall q . LuaState q s t)
-    -> m u
-lxRunT resolveST resolveIO onError onPure (LuaState lstate) = do
-    env <- resolveST $ LuaEnvironment
-        <$> newSTRef 0
-        <*> newSTRef lxDefaultMetatable
-        <*> newSTRef lxDefaultMetatable
-        <*> newSTRef lxDefaultMetatable
-        <*> newSTRef lxDefaultMetatable
-        <*> newSTRef lxDefaultMetatable
-        <*> newSTRef lxDefaultMetatable
-        <*> (newSTRef =<< makeDefaultWarnHandler)
-        <*> newSTRef (LNil, False, False, False)
-        <*> newSTRef 0
-        <*> newSTRef 4000
-    pthread <- resolveST $ newSTRef LTRunning
-    let !ctx = LuaContext {
-        lctxEnvironment = env,
-        lctxYieldable = False,
-        lctxErrHandler = pure,
-        lctxCurrentThread = pthread,
-        lctxStack = [],
-        lctxStackInnerDepth = 0}
-    driveY $ Y.wrap $ lstate ctx
-    where
-    driveY (Y.Pure x) = onPure x
-    driveY (Y.Error e) = onError e
-    driveY (Y.Yield _ g) = driveY $ g undefined
-    driveY (Y.Lift (LuaLiftedST st) g) = resolveST st >>= driveY . g
-    driveY (Y.Lift (LuaLiftedIO io) g) = resolveIO io >>= driveY . g
+    -> r
+lxRunT onST onIO onError onPure (LuaState lstate) = do
+    onST
+        (LuaEnvironment
+            <$> newSTRef 2
+            <*> newSTRef lxDefaultMetatable
+            <*> newSTRef lxDefaultMetatable
+            <*> newSTRef lxDefaultMetatable
+            <*> newSTRef lxDefaultMetatable
+            <*> newSTRef lxDefaultMetatable
+            <*> newSTRef lxDefaultMetatable
+            <*> (newSTRef =<< makeDefaultWarnHandler)
+            <*> newSTRef (LNil, False, False, False)
+            <*> newSTRef 0
+            <*> newSTRef 4000) $
+        \env -> do
+            onST (newSTRef $! LTRunning False) $ \pthread -> do
+                let !ctx = LuaContext {
+                    lctxEnvironment = env,
+                    lctxErrHandler = pure,
+                    lctxCurrentThread = LThread (LuaId 1) (LuaThread pthread),
+                    lctxStack = [],
+                    lctxStackInnerDepth = 0,
+                    lctxOnClose = mempty}
+                Y.execute (lstate ctx)
+                    (\box cont -> do
+                        case box of
+                            LuaLiftedST st -> onST st cont
+                            LuaLiftedIO io -> onIO io cont)
+                    onError
+                    onPure
 
 
 makeDefaultWarnHandler :: ST s (LuaValue q s -> LuaState q s ())
@@ -809,21 +850,30 @@ lxLocalContext f (LuaState lstate) = LuaState $ \ !ctx -> do
 
 lxYield :: [LuaValue q s] -> LuaState q s [LuaValue q s]
 lxYield bvals = do
-    yieldable <- lctxYieldable <$> lxContext
-    if yieldable
-        then LuaState $ \_ -> Y.yield bvals
+    ~LuaContext {
+            lctxCurrentThread = LThread _ currentthread,
+            lctxOnClose = onclose}
+        <- lxContext
+    isyieldable <- lxIsYieldable currentthread
+    if isyieldable
+        then lxLiftY $ Y.yield (onclose, bvals)
         else lxError $ errWrongYield
 
 
 lxError :: LuaValue q s -> LuaState q s a
 lxError err = do
     errh <- lctxErrHandler <$> lxContext
-    err' <- lxWithErrHandler pure $ errh err
-    LuaState $ \_ -> Y.raise err'
+    err' <- lxWithErrHandler return $ errh err
+    lxLiftY $ Y.raise err'
 
 
 lxTry :: LuaState q s t -> LuaState q s (Either (LuaValue q s) t)
-lxTry (LuaState act) = LuaState $ \ !ctx -> Y.try $ act ctx
+lxTry (LuaState act) = do
+    LuaState $
+        \ctx -> do
+            Y.catch
+                (Right <$> act ctx)
+                (return . Left)
 
 
 lxStackLevel :: LuaState q s t -> LuaState q s t
@@ -881,14 +931,37 @@ lxFinally
     -> (LuaValue q s -> LuaState q s ())
     -> LuaState q s t
 lxFinally act fin = do
-    ar <- lxTry act
-    case ar of
+    ctx <- lxContext
+    let onclosemine merr = do
+        case merr of
+            Nothing -> do
+                fr <- lxTry $ fin LNil
+                case fr of
+                    Left err -> return $ Just err
+                    Right _ -> return $ merr
+            Just err -> do
+                fr <- lxTry $ fin err
+                case fr of
+                    Left err2 -> lxWarn err2
+                    Right _ -> return ()
+                return $ merr
+    let chainelem = LuaCloseChain $ \merr -> do
+        case onclosemine merr of
+            LuaState lstate -> lstate ctx
+    ar <- lxLocalContext
+        (\myctx -> myctx {
+            lctxOnClose = chainelem <> lctxOnClose myctx}) $
+        lxTry act
+    let LThread _ (LuaThread pcurrent) = lctxCurrentThread ctx
+    ~(LTRunning isyieldable) <- lxRead pcurrent
+    lxWrite pcurrent $ (LTRunning False)
+    result <- case ar of
         Left aerr -> do
             fr <- lxTry $ fin aerr
             case fr of
                 Left ferr -> lxWarn ferr
                 Right _ -> return ()
-            LuaState $ \_ -> Y.raise aerr
+            lxLiftY $ Y.raise aerr
         Right asuc -> do
             fr <- lxTry $ fin LNil
             case fr of
@@ -897,16 +970,22 @@ lxFinally act fin = do
                     case fr2 of
                         Left ferr2 -> lxWarn ferr2
                         Right _ -> return ()
-                    LuaState $ \_ -> Y.raise ferr
+                    lxLiftY $ Y.raise ferr
                 Right _ -> return $ asuc
+    lxWrite pcurrent $ (LTRunning isyieldable)
+    return $ result
+
+
+lxLiftY :: LuaCoroutine q s a -> LuaState q s a
+lxLiftY cor = LuaState $ \_ -> cor
 
 
 lxLiftST :: ST s a -> LuaState q s a
-lxLiftST st = LuaState $ \_ -> Y.lift $ LuaLiftedST st
+lxLiftST st = lxLiftY $ Y.lift $ LuaLiftedST st
 
 
 lxTryLiftIO :: IO a -> LuaState q s (Maybe a)
-lxTryLiftIO act = LuaState $ \_ -> Y.lift $ LuaLiftedIO act
+lxTryLiftIO act = lxLiftY $ Y.lift $ LuaLiftedIO act
 
 
 lxAlloc :: a -> LuaState q s (LuaRef q s a)
@@ -921,59 +1000,94 @@ lxWrite :: LuaRef q s a -> a -> LuaState q s ()
 lxWrite ref !x = lxLiftST $ writeSTRef ref x
 
 
-lxModify :: LuaRef q s a -> (a -> a) -> LuaState q s ()
-lxModify ref f = lxLiftST $ modifySTRef' ref f
-
-
 lxNewThread
     :: LuaFunction q s
-    -> LuaState q s (LuaThread q s)
+    -> LuaState q s (LuaValue q s)
 lxNewThread func = do
     env <- lctxEnvironment <$> lxContext
+    threadid <- lxNewId
     pthread <- lxAlloc $ LTDead
-    let start args = do
+    let value = LThread threadid (LuaThread pthread)
+    suspended <- lxLiftY $ Y.suspend $ \args -> do
         let LuaState lstate = func args
-        let !ctx = LuaContext {
+        let ctx = LuaContext {
             lctxEnvironment = env,
-            lctxYieldable = True,
             lctxErrHandler = pure,
-            lctxCurrentThread = pthread,
+            lctxCurrentThread = value,
             lctxStack = [],
-            lctxStackInnerDepth = 0}
-        Y.wrap $ lstate ctx
-    lxWrite pthread $ LTSuspended start
-    return $ pthread
+            lctxStackInnerDepth = 1,
+            lctxOnClose = mempty}
+        result <- lstate $! ctx
+        return $ (mempty, result)
+    lxWrite pthread $ LTSuspended mempty suspended
+    return $ value
 
 
 lxResume
     :: LuaThread q s
     -> [LuaValue q s]
     -> LuaState q s (Either (LuaValue q s) [LuaValue q s])
-lxResume pthread ivals = do
-    ts <- lxRead pthread
-    case ts of
-        LTSuspended f -> do
-            LuaContext {
-                    lctxCurrentThread = current,
+lxResume (LuaThread pthread) ivals = do
+    lxStackLevel $ do
+        state <- lxRead pthread
+        case state of
+            LTSuspended _ suspended -> do
+                resumeThread suspended
+            _ -> return $ Left errNonSuspended
+    where
+    resumeThread suspended = do
+        ~LuaContext {
+                lctxEnvironment = LuaEnvironment {
+                    lenvStackOuterDepth = pouterdepth},
+                lctxCurrentThread = LThread _ (LuaThread pcurrent),
+                lctxStackInnerDepth = innerdepth}
+            <- lxContext
+        outerdepth <- lxRead pouterdepth
+        ~(LTRunning isyieldable) <- lxRead pcurrent
+        lxWrite pouterdepth $ outerdepth + innerdepth
+        lxWrite pcurrent $ LTNormal isyieldable
+        lxWrite pthread $ LTRunning True
+        (result, rtstate) <- lxLiftY $ Y.resume
+            suspended
+            (\(onclose, ovals) suspended2 -> do
+                return $ (Right ovals, LTSuspended onclose suspended2))
+            (\err -> do
+                return $ (Left err, LTDead))
+            (\(_, ovals) -> do
+                return $ (Right ovals, LTDead))
+            ivals
+        lxWrite pthread $ rtstate
+        lxWrite pcurrent $ LTRunning isyieldable
+        lxWrite pouterdepth $ outerdepth
+        return $ result
+
+
+lxThreadClose
+    :: LuaThread q s
+    -> LuaState q s (Maybe (LuaValue q s))
+lxThreadClose (LuaThread pthread) = do
+    state <- lxRead pthread
+    case state of
+        LTRunning _ -> lxError $ errWrongThreadClose
+        LTSuspended (LuaCloseChain onclose) _ -> do
+            ~LuaContext {
                     lctxEnvironment = LuaEnvironment {
                         lenvStackOuterDepth = pouterdepth},
+                    lctxCurrentThread = LThread _ (LuaThread pcurrent),
                     lctxStackInnerDepth = innerdepth}
                 <- lxContext
             outerdepth <- lxRead pouterdepth
+            ~(LTRunning isyieldable) <- lxRead pcurrent
             lxWrite pouterdepth $ outerdepth + innerdepth
-            lxWrite current $ LTNormal
-            lxWrite pthread $ LTRunning
-            (result, rtstate) <- driveY (f ivals)
-            lxWrite pthread $ rtstate
-            lxWrite current $ LTRunning
+            lxWrite pcurrent $ LTNormal isyieldable
+            lxWrite pthread $ LTRunning False
+            result <- lxLiftY $ onclose Nothing
+            lxWrite pthread $ LTDead
+            lxWrite pcurrent $ LTRunning isyieldable
             lxWrite pouterdepth $ outerdepth
             return $ result
-        _ -> return $ Left errNonSuspended
-    where
-    driveY (Y.Pure x) = return $ (Right x, LTDead)
-    driveY (Y.Error e) = return $ (Left e, LTDead)
-    driveY (Y.Yield vals g) = return $ (Right vals, LTSuspended g)
-    driveY (Y.Lift box g) = (LuaState $ \_ -> Y.lift box) >>= driveY . g
+        LTNormal _ -> lxError $ errWrongThreadClose
+        LTDead -> return Nothing
 
 
 lxThreadState
@@ -983,20 +1097,21 @@ lxThreadState
     -> LuaState q s t
     -> LuaState q s t
     -> LuaState q s t
-lxThreadState thread onRunning onSuspended onNormal onDead = do
-    state <- lxRead thread
+lxThreadState (LuaThread pthread) onRunning onSuspended onNormal onDead = do
+    state <- lxRead pthread
     case state of
-        LTRunning -> onRunning
-        LTSuspended _ -> onSuspended
-        LTNormal -> onNormal
+        LTRunning _ -> onRunning
+        LTSuspended _ _ -> onSuspended
+        LTNormal _ -> onNormal
         LTDead -> onDead
 
 
 lxNewId :: LuaState q s LuaId
 lxNewId = do
     ref <- lenvCounter . lctxEnvironment <$> lxContext
-    lxModify ref (+1)
-    LuaId <$> lxRead ref
+    n <- lxRead ref
+    lxWrite ref $ n + 1
+    return $ LuaId $ n + 1
 
 
 lxKey :: LuaValue q s -> T.Key
@@ -1671,3 +1786,23 @@ lxLocalStack
     -> LuaState q s t
 lxLocalStack func act = do
     lxLocalContext (lctxModifyStack func) act
+
+
+lxCurrentThread
+    :: LuaState q s (LuaValue q s, Bool)
+lxCurrentThread = do
+    value <- lctxCurrentThread <$> lxContext
+    case value of
+        LThread (LuaId 1) _ -> return $ (value, True)
+        _ -> return $ (value, False)
+
+
+lxIsYieldable
+    :: LuaThread q s
+    -> LuaState q s Bool
+lxIsYieldable (LuaThread pthread) = do
+    state <- lxRead pthread
+    case state of
+        LTRunning b -> return $ b
+        LTNormal b -> return $ b
+        _ -> return $ True

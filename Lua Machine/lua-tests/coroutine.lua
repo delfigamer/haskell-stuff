@@ -18,7 +18,6 @@ assert(not pcall(coroutine.yield))
 assert(not pcall(coroutine.resume, 0))
 assert(not pcall(coroutine.status, 0))
 
-
 -- tests for multiple yield/resume arguments
 
 local function eqtab (t1, t2)
@@ -65,7 +64,9 @@ eqtab(_G.x, {"xuxu"})
 assert(s and a == 1 and b == 2 and c == 3 and d == nil)
 assert(coroutine.status(f) == "dead")
 s, a = coroutine.resume(f, "xuxu")
-assert(not s and string.find(a, "dead") and coroutine.status(f) == "dead")
+assert(not s
+    and string.find(a, "Attempt to resume a non%-suspended coroutine")
+    and coroutine.status(f) == "dead")
 
 
 -- yields in tail calls
@@ -132,15 +133,15 @@ do
   assert(coroutine.close(co))
 
   -- cannot close the running coroutine
-  local st, msg = pcall(coroutine.close, coroutine.running())
-  assert(not st and string.find(msg, "running"))
+  local st, msg = xpcall(coroutine.close, nil, coroutine.running())
+  assert(not st and string.find(msg, "Attempt to close an active coroutine"))
 
   local main = coroutine.running()
 
   -- cannot close a "normal" coroutine
   ;(coroutine.wrap(function ()
     local st, msg = pcall(coroutine.close, main)
-    assert(not st and string.find(msg, "normal"))
+    assert(not st and string.find(msg, "Attempt to close an active coroutine"))
   end))()
 
   -- to-be-closed variables in coroutines
@@ -196,7 +197,7 @@ end
 -- yielding across C boundaries
 
 co = coroutine.wrap(function()
-       assert(not pcall(table.sort,{1,2,3}, coroutine.yield))
+       -- assert(not pcall(table.sort,{1,2,3}, coroutine.yield))
        assert(coroutine.isyieldable())
        coroutine.yield(20)
        return 30
@@ -238,7 +239,7 @@ assert(not r and msg == 240)
 -- unyieldable C call
 do
   local function f (c)
-          assert(not coroutine.isyieldable())
+          -- assert(not coroutine.isyieldable())
           return c .. c
         end
 
@@ -252,29 +253,29 @@ end
 
 
 
-do   -- testing single trace of coroutines
-  local X
-  local co = coroutine.create(function ()
-    coroutine.yield(10)
-    return 20;
-  end)
-  local trace = {}
-  local function dotrace (event)
-    trace[#trace + 1] = event
-  end
-  debug.sethook(co, dotrace, "clr")
-  repeat until not coroutine.resume(co)
-  local correcttrace = {"call", "line", "call", "return", "line", "return"}
-  assert(#trace == #correcttrace)
-  for k, v in pairs(trace) do
-    assert(v == correcttrace[k])
-  end
-end
+-- do   -- testing single trace of coroutines
+  -- local X
+  -- local co = coroutine.create(function ()
+    -- coroutine.yield(10)
+    -- return 20;
+  -- end)
+  -- local trace = {}
+  -- local function dotrace (event)
+    -- trace[#trace + 1] = event
+  -- end
+  -- debug.sethook(co, dotrace, "clr")
+  -- repeat until not coroutine.resume(co)
+  -- local correcttrace = {"call", "line", "call", "return", "line", "return"}
+  -- assert(#trace == #correcttrace)
+  -- for k, v in pairs(trace) do
+    -- assert(v == correcttrace[k])
+  -- end
+-- end
 
 -- errors in coroutines
 function foo ()
-  assert(debug.getinfo(1).currentline == debug.getinfo(foo).linedefined + 1)
-  assert(debug.getinfo(2).currentline == debug.getinfo(goo).linedefined)
+  -- assert(debug.getinfo(1).currentline == debug.getinfo(foo).linedefined + 1)
+  -- assert(debug.getinfo(2).currentline == debug.getinfo(goo).linedefined)
   coroutine.yield(3)
   error(foo)
 end
@@ -282,7 +283,7 @@ end
 function goo() foo() end
 x = coroutine.wrap(goo)
 assert(x() == 3)
-local a,b = pcall(x)
+local a,b = xpcall(x, nil)
 assert(not a and b == foo)
 
 x = coroutine.create(goo)
@@ -291,7 +292,9 @@ assert(a and b == 3)
 a,b = coroutine.resume(x)
 assert(not a and b == foo and coroutine.status(x) == "dead")
 a,b = coroutine.resume(x)
-assert(not a and string.find(b, "dead") and coroutine.status(x) == "dead")
+assert(not a
+    and string.find(b, "Attempt to resume a non%-suspended coroutine")
+    and coroutine.status(x) == "dead")
 
 
 -- co-routines x for loop
@@ -313,7 +316,7 @@ assert(a == 5^4)
 
 
 -- access to locals of collected corroutines
-local C = {}; setmetatable(C, {__mode = "kv"})
+-- local C = {}; setmetatable(C, {__mode = "kv"})
 local x = coroutine.wrap (function ()
             local a = 10
             local function f () a = a+10; return a end
@@ -323,13 +326,13 @@ local x = coroutine.wrap (function ()
             end
           end)
 
-C[1] = x;
+-- C[1] = x;
 
 local f = x()
 assert(f() == 21 and x()() == 32 and x() == f)
 x = nil
-collectgarbage()
-assert(C[1] == undef)
+-- collectgarbage()
+-- assert(C[1] == undef)
 assert(f() == 43 and f() == 53)
 
 
@@ -412,7 +415,7 @@ else
   print "testing yields inside hooks"
 
   local turn
-  
+
   function fact (t, x)
     assert(turn == t)
     if x == 0 then return 1
@@ -514,7 +517,7 @@ else
 
 
   print "testing coroutine API"
-  
+
   -- reusing a thread
   assert(T.testC([[
     newthread      # create thread
@@ -784,7 +787,7 @@ do   -- a few more tests for comparison operators
     until res ~= 10
     return res
   end
-  
+
   local function test ()
     local a1 = setmetatable({x=1}, mt1)
     local a2 = setmetatable({x=2}, mt2)
@@ -796,7 +799,7 @@ do   -- a few more tests for comparison operators
     assert(2 >= a2)
     return true
   end
-  
+
   run(test)
 
 end
@@ -807,13 +810,13 @@ assert(run(function ()
            end, {"nidx", "idx"}) == print)
 
 -- getuptable & setuptable
-do local _ENV = _ENV
-  f = function () AAA = BBB + 1; return AAA end
-end
-g = new(10); g.k.BBB = 10;
-debug.setupvalue(f, 1, g)
-assert(run(f, {"idx", "nidx", "idx"}) == 11)
-assert(g.k.AAA == 11)
+-- do local _ENV = _ENV
+  -- f = function () AAA = BBB + 1; return AAA end
+-- end
+-- g = new(10); g.k.BBB = 10;
+-- debug.setupvalue(f, 1, g)
+-- assert(run(f, {"idx", "nidx", "idx"}) == 11)
+-- assert(g.k.AAA == 11)
 
 print"+"
 
@@ -956,11 +959,11 @@ co = coroutine.wrap(function (...) return
           cannot be here!
        ]],
        [[  # 1st continuation
-         yieldk 0 3 
+         yieldk 0 3
          cannot be here!
        ]],
        [[  # 2nd continuation
-         yieldk 0 4 
+         yieldk 0 4
          cannot be here!
        ]],
        [[  # 3th continuation

@@ -12,6 +12,7 @@ module Lua.Debug (
     luadRunFunction,
     luadSetDebugHook,
     luadSetLocation,
+    luadSetMetatable,
     luadSetStackLimit,
     luadWithinLocal,
 ) where
@@ -67,7 +68,7 @@ luadSetLocation mpr = do
 
 luadWithinLocal
     :: Maybe (SourceRange, BSt.ByteString)
-    -> Either (LuaValue q s) (LuaRef q s (LuaValue q s))
+    -> LuaRef q s (LuaValue q s)
     -> LuaState q s t
     -> LuaState q s t
 luadWithinLocal mdef slot act = do
@@ -123,3 +124,25 @@ luadSetDebugHook = lxSetDebugHook
 luadSetStackLimit
     :: Int -> LuaState q s (Maybe Int)
 luadSetStackLimit = lxSetStackLimit
+
+
+luadSetMetatable
+    :: LuaValue q s
+    -> LuaValue q s
+    -> LuaState q s ()
+luadSetMetatable a b = do
+    meta <- case b of
+        LTable _ _ -> return $ lxProduceMetatable b
+        LNil -> return $ lxDefaultMetatable
+        _ -> lxError $ errWrongMetatableValue
+    case a of
+        LNil -> lxSetNilMetatable meta
+        LBool _ -> lxSetBoolMetatable meta
+        LInteger _ -> lxSetNumberMetatable meta
+        LRational _ -> lxSetNumberMetatable meta
+        LDouble _ -> lxSetNumberMetatable meta
+        LString _ -> lxSetStringMetatable meta
+        LFunction _ _ -> lxSetFunctionMetatable meta
+        LThread _ _ -> lxSetThreadMetatable meta
+        LTable _ (LuaTable _ pmeta) -> lxWrite pmeta $ meta
+        _ -> lxError $ errWrongMetatableOwner a

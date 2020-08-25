@@ -5,31 +5,35 @@ collectgarbage()
 
 local function errmsg (code, m)
   local st, msg = load(code)
-  assert(not st and string.find(msg, m))
+  assert(not st)
+  if not string.find(msg, m) then
+    print(msg, m)
+    assert(false)
+  end
 end
 
 -- cannot see label inside block
-errmsg([[ goto l1; do ::l1:: end ]], "label 'l1'")
-errmsg([[ do ::l1:: end goto l1; ]], "label 'l1'")
+errmsg([[ goto l1; do ::l1:: end ]], "Invalid label l1")
+errmsg([[ do ::l1:: end goto l1; ]], "Invalid label l1")
 
 -- repeated label
-errmsg([[ ::l1:: ::l1:: ]], "label 'l1'")
-errmsg([[ ::l1:: do ::l1:: end]], "label 'l1'")
+errmsg([[ ::l1:: ::l1:: ]], "Label l1 is already defined")
+errmsg([[ ::l1:: do ::l1:: end]], "Label l1 is already defined")
 
 
 -- undefined label
-errmsg([[ goto l1; local aa ::l1:: ::l2:: print(3) ]], "local 'aa'")
+errmsg([[ goto l1; local aa ::l1:: ::l2:: print(3) ]], "Invalid goto")
 
 -- jumping over variable definition
 errmsg([[
 do local bb, cc; goto l1; end
 local aa
 ::l1:: print(3)
-]], "local 'aa'")
+]], "Invalid goto")
 
 -- jumping into a block
-errmsg([[ do ::l1:: end goto l1 ]], "label 'l1'")
-errmsg([[ goto l1 do ::l1:: end ]], "label 'l1'")
+errmsg([[ do ::l1:: end goto l1 ]], "Invalid label l1")
+errmsg([[ goto l1 do ::l1:: end ]], "Invalid label l1")
 
 -- cannot continue a repeat-until with variables
 errmsg([[
@@ -38,7 +42,7 @@ errmsg([[
     local xuxu = 10
     ::cont::
   until xuxu < x
-]], "local 'xuxu'")
+]], "Invalid goto")
 
 -- simple gotos
 local x
@@ -153,7 +157,7 @@ end
 ::escape::
 --------------------------------------------------------------------------------
 -- testing closing of upvalues
-
+--[==[
 local debug = require 'debug'
 
 local function foo ()
@@ -216,7 +220,7 @@ for i = 3, 5, 2 do
       == (i == j))
   end
 end
-
+]==]
 --------------------------------------------------------------------------------
 -- testing if x goto optimizations
 

@@ -11,6 +11,7 @@ module Lua.Interpret (
 ) where
 
 
+import Control.Exception
 import Control.Monad.Reader
 import Data.List
 import Data.Maybe
@@ -28,10 +29,7 @@ data LirContext q s = LirContext {
     lirxBody :: !IrBody,
     lirxVararg :: ![LuaValue q s],
     lirxUpvalues :: !(A.Array Int (LuaRef q s (LuaValue q s))),
-    lirxUpconsts :: !(A.Array Int (LuaValue q s)),
-    lirxLocals :: !(V.STArray s Int (LuaRef q s (LuaValue q s))),
-    lirxConsts :: !(V.STArray s Int (LuaValue q s)),
-    lirxGuards :: !(V.STArray s Int (LuaValue q s))}
+    lirxLocals :: !(V.STArray s Int (LuaRef q s (LuaValue q s)))}
 
 
 lirValue
@@ -53,15 +51,10 @@ lirValue !ctx ira = do
                 return $ (k, v)
             let ikvs = zip (map LInteger [1..]) ivs ++ kvs
             luaCreateTable ikvs
-        IASlot (ISLocal ix) -> do
+        IALocal ix -> do
             ref <- luaLiftST $ V.readArray (lirxLocals ctx) ix
             luaRead $ ref
-        IASlot (ISConst ix) -> do
-            luaLiftST $ V.readArray (lirxConsts ctx) ix
-        IASlot (ISGuard ix) -> do
-            luaLiftST $ V.readArray (lirxGuards ctx) ix
         IAUpvalue ix -> luaRead $ lirxUpvalues ctx A.! ix
-        IAUpconst ix -> return $ lirxUpconsts ctx A.! ix
         IAIndex tableira indexira -> binary luaGet tableira indexira
         IAUnaryUnm aira -> unary luaArithUnm aira
         IAUnaryLen aira -> unary luaLen aira
@@ -109,28 +102,17 @@ lirValue !ctx ira = do
                 then return $ a
                 else lirValue ctx bira
         IAFunction
-                mlocation upvaluedefs upconstdefs paramdefs
-                maxl maxc maxg funcbody -> do
-            upvalues <- forM upvaluedefs (\(source, mdef) -> do
+                mlocation upvaluedefs paramdefs
+                maxindex funcbody -> do
+            upvalues <- forM upvaluedefs $ \(source, mdef) -> do
                 ref <- case source of
                     Left ix -> return $! lirxUpvalues ctx A.! ix
                     Right ix -> luaLiftST $ V.readArray (lirxLocals ctx) ix
-                return $ (mdef, ref))
-            upconsts <- forM upconstdefs (\(source, mdef) -> do
-                value <- case source of
-                        Left ix -> return $! lirxUpconsts ctx A.! ix
-                        Right (ISLocal ix) -> do
-                            ref <- luaLiftST $ V.readArray (lirxLocals ctx) ix
-                            luaRead $ ref
-                        Right (ISConst ix) -> do
-                            luaLiftST $ V.readArray (lirxConsts ctx) ix
-                        Right (ISGuard ix) -> do
-                            luaLiftST $ V.readArray (lirxGuards ctx) ix
-                return $ (mdef, value))
+                return $ (mdef, ref)
             luaCreateFunction $
                 lirFunction
-                    mlocation upvalues upconsts paramdefs
-                    maxl maxc maxg funcbody
+                    mlocation upvalues paramdefs
+                    maxindex funcbody
     where
     unary !lfunc !aira = do
         a <- lirValue ctx aira
@@ -192,79 +174,101 @@ lirSinkPrepare !ctx ira = do
 
 lirLocal
     :: LirContext q s
+    -> Int
     -> LuaValue q s
-    -> (Maybe (SourceRange, BSt.ByteString), IrSlot)
-    -> LuaState q s (Either (LuaFrameReturn q s) IrAction)
-    -> LuaState q s (Either (LuaFrameReturn q s) IrAction)
-lirLocal !ctx !value (mdef, slot) act = do
-    case slot of
-        ISLocal ix -> do
-            ref <- luaAlloc $ value
-            luaLiftST $ V.writeArray (lirxLocals ctx) ix $ ref
-            r <- luadWithinLocal mdef (Right ref) $ act
-            luaLiftST $ V.writeArray (lirxLocals ctx) ix $ undefined
-            return $ r
-        ISConst ix -> do
-            luaLiftST $ V.writeArray (lirxConsts ctx) ix $ value
-            luadWithinLocal mdef (Left value) $ act
-        ISGuard ix -> do
-            luaLiftST $ V.writeArray (lirxGuards ctx) ix $ value
+    -> (Maybe (SourceRange, BSt.ByteString), Bool, Int)
+    -> (Int -> LuaState q s (Either (LuaFrameReturn q s) IrBlock))
+    -> LuaState q s (Either (LuaFrameReturn q s) IrBlock)
+lirLocal !ctx !depth !value (mdef, toclose, ix) act = do
+    assert (ix == depth) (return ())
+    ref <- luaAlloc $ value
+    luaLiftST $ V.writeArray (lirxLocals ctx) ix $ ref
+    r <- if toclose
+        then do
             luaCloseAfter value $
-                luadWithinLocal mdef (Left value) $ act
+                luadWithinLocal mdef ref $
+                    act $! depth + 1
+        else do
+            luadWithinLocal mdef ref $
+                act $! depth + 1
+    luaLiftST $ V.writeArray (lirxLocals ctx) ix $ undefined
+    return $ r
 
 
 lirContinue
     :: LirContext q s
-    -> Either (LuaFrameReturn q s) IrAction
-    -> LuaState q s (Either (LuaFrameReturn q s) IrAction)
-lirContinue !ctx result = do
+    -> Int
+    -> Either (LuaFrameReturn q s) IrBlock
+    -> LuaState q s (Either (LuaFrameReturn q s) IrBlock)
+lirContinue !ctx !depth result = do
     case result of
-        Left r -> return $ Left r
-        Right ira -> lirAction ctx ira
+        Right (IrBlock _ targetdepth ira) -> do
+            case compare targetdepth depth of
+                LT -> return $ result
+                EQ -> lirAction ctx depth ira
+                GT -> undefined
+        _ -> return $ result
 
 
 lirOpen
     :: LirContext q s
+    -> Int
     -> [LuaValue q s]
-    -> [(Maybe (SourceRange, BSt.ByteString), IrSlot)]
+    -> [(Maybe (SourceRange, BSt.ByteString), Bool, Int)]
     -> IrAction
-    -> LuaState q s (Either (LuaFrameReturn q s) IrAction)
-lirOpen !ctx values targets next = do
+    -> LuaState q s (Either (LuaFrameReturn q s) IrBlock)
+lirOpen !ctx !depth values targets next = do
     case (values, targets) of
         (v:vs, s:s':ss) -> do
-            lirLocal ctx v s $ do
-                lirOpen ctx vs (s':ss) next >>= lirContinue ctx
+            lirLocal ctx depth v s $ \ !depth2 -> do
+                lirOpen ctx depth2 vs (s':ss) next >>= lirContinue ctx depth2
         ([], s:s':ss) -> do
-            lirLocal ctx LNil s $ do
-                lirOpen ctx [] (s':ss) next >>= lirContinue ctx
+            lirLocal ctx depth LNil s $ \ !depth2 -> do
+                lirOpen ctx depth2 [] (s':ss) next >>= lirContinue ctx depth2
         (v:_, [s]) -> do
-            lirLocal ctx v s $ do
-                lirAction ctx next
+            lirLocal ctx depth v s $ \ !depth2 -> do
+                lirAction ctx depth2 next
         ([], [s]) -> do
-            lirLocal ctx LNil s $ do
-                lirAction ctx next
+            lirLocal ctx depth LNil s $ \ !depth2 -> do
+                lirAction ctx depth2 next
         _ -> undefined
 
 
 lirAction
     :: LirContext q s
+    -> Int
     -> IrAction
-    -> LuaState q s (Either (LuaFrameReturn q s) IrAction)
-lirAction !ctx ira = do
+    -> LuaState q s (Either (LuaFrameReturn q s) IrBlock)
+lirAction !ctx !depth ira = do
     case ira of
+        IAMark pr next -> do
+            luadSetLocation $ Just pr
+            lirAction ctx depth next
         IAAssign sourceira sinks next -> do
             sources <- lirList ctx sourceira
             preps <- mapM (lirSinkPrepare ctx) sinks
             zipWithM_ ($) preps (sources ++ repeat LNil)
-            lirAction ctx next
+            lirAction ctx depth next
         IAOpen sourceira targets next -> do
             sources <- lirList ctx sourceira
-            lirOpen ctx sources targets next >>= lirContinue ctx
+            lirOpen ctx depth sources targets next >>= lirContinue ctx depth
         IASequence list next -> do
             _ <- lirList ctx list
-            lirAction ctx next
-        IADrop _ next -> do
-            return $ Right $ next
+            lirAction ctx depth next
+        IATest condira target next -> do
+            cond <- lirValue ctx condira
+            if luaToBoolean cond
+                then lirAction ctx depth next
+                else do
+                    let Just block = find
+                            (\(IrBlock ix _ _) -> ix == target)
+                            (lirxBody ctx)
+                    lirContinue ctx depth $ Right block
+        IAJump target -> do
+            let Just block = find
+                    (\(IrBlock ix _ _) -> ix == target)
+                    (lirxBody ctx)
+            lirContinue ctx depth $ Right block
         IAReturn listira -> do
             result <- lirList ctx listira
             return $ Left $ Right $ result
@@ -278,77 +282,49 @@ lirAction !ctx ira = do
             args <- lirList ctx argsira
             func <- luaGet obj index
             return $ Left $ Left $ (luaCall func, obj:args)
-        IABranch condira pos neg -> do
-            cond <- lirValue ctx condira
-            if luaToBoolean cond
-                then lirAction ctx pos
-                else lirAction ctx neg
-        IABlock bix -> do
-            case lookup bix $ lirxBody ctx of
-                Just blockira -> lirAction ctx blockira
-                Nothing -> lirInvalid
-        IAMark pr next -> do
-            luadSetLocation $ Just pr
-            lirAction ctx next
 
 
 lirExecute
     :: LirContext q s
     -> LuaState q s (LuaFrameReturn q s)
 lirExecute !ctx = do
-    let (_, !main):_ = lirxBody ctx
-    result <- lirAction ctx main
+    let IrBlock _ !depth !main:_ = lirxBody ctx
+    result <- lirAction ctx depth main
     case result of
         Left fret -> return $ fret
-        Right _ -> lirInvalid
-
-
-lirInvalid :: LuaState q s a
-lirInvalid = luaError $ LString "Invalid IR"
+        Right _ -> undefined
 
 
 lirFunction
     :: Maybe (SourceRange, BSt.ByteString)
     -> [(Maybe (SourceRange, BSt.ByteString), LuaRef q s (LuaValue q s))]
-    -> [(Maybe (SourceRange, BSt.ByteString), LuaValue q s)]
-    -> [(Int, Maybe (SourceRange, BSt.ByteString))]
-    -> Int -> Int -> Int
+    -> [Maybe (SourceRange, BSt.ByteString)]
+    -> Int
     -> IrBody
     -> LuaFunction q s
-lirFunction mlocation upvalues upconsts paramdefs maxl maxc maxg funcbody = do
+lirFunction mlocation upvalues paramdefs maxindex funcbody = do
     let !upvalueArray = A.listArray
             (0, length upvalues - 1)
             (map snd upvalues)
-    let !upconstArray = A.listArray
-            (0, length upconsts - 1)
-            (map snd upconsts)
-    let !upvalueList =
-            map (\(mdef, ref) -> (mdef, Right ref)) upvalues
-            ++ map (\(mdef, value) -> (mdef, Left value)) upconsts
     \args -> do
-        localArray <- luaLiftST $ V.newArray (0, maxl - 1) undefined
-        constArray <- luaLiftST $ V.newArray (0, maxc - 1) LNil
-        guardArray <- luaLiftST $ V.newArray (0, maxg - 1) LNil
-        (vararg, argvarlist) <- parseArgs localArray paramdefs args
+        localArray <- luaLiftST $ V.newArray (0, maxindex) undefined
+        (vararg, locals) <- parseArgs 0 localArray paramdefs args
         let !lirContext = LirContext {
             lirxBody = funcbody,
             lirxVararg = vararg,
             lirxUpvalues = upvalueArray,
-            lirxUpconsts = upconstArray,
-            lirxLocals = localArray,
-            lirxConsts = constArray,
-            lirxGuards = guardArray}
-        luadRunFunction mlocation upvalueList argvarlist $
+            lirxLocals = localArray}
+        luadRunFunction mlocation upvalues locals $
             lirExecute lirContext
     where
-    parseArgs _ [] args = do
+    parseArgs _ _ [] args = do
         return $ (args, [])
-    parseArgs localArray ((ix, mdef):ps) args = do
+    parseArgs ix localArray (mdef:ps) args = do
         let (arg, as) = fromMaybe (LNil, []) (uncons args)
         ref <- luaAlloc arg
         luaLiftST $ V.writeArray localArray ix $ ref
-        (vararg, argvarlist) <- parseArgs localArray ps as
-        return $ (vararg, (mdef, Right ref):argvarlist)
+        (vararg, locals) <- parseArgs (ix + 1) localArray ps as
+        return $ (vararg, (mdef, ref):locals)
 
 
 luaLoad
@@ -359,16 +335,15 @@ luaLoad
 luaLoad filename source fenv = do
     case translateLua filename source of
         Left err -> return $ Left $ luaPush err
-        Right (maxl, maxc, maxg, funcbody) -> do
+        Right (maxindex, funcbody) -> do
             envref <- luaAlloc $ fenv
             let mlocation = Just (nullRange filename, "(chunk)")
             let upvalues = [(Just (nullRange filename, "_ENV"), envref)]
-            let upconsts = []
             let paramdefs = []
             func <- luaCreateFunction $
                 lirFunction
-                    mlocation upvalues upconsts paramdefs
-                    maxl maxc maxg funcbody
+                    mlocation upvalues paramdefs
+                    maxindex funcbody
             return $ Right $ func
 
 

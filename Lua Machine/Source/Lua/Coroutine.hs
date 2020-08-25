@@ -3,12 +3,14 @@
 
 
 module Lua.Coroutine (
-    CoroutineT,
-    Thread(..),
+    Coroutine,
+    Suspend,
+    catch,
+    execute,
     lift,
     raise,
-    try,
-    wrap,
+    resume,
+    suspend,
     yield,
 ) where
 
@@ -16,68 +18,119 @@ module Lua.Coroutine (
 import Control.Monad
 
 
-newtype CoroutineT a b e f t = CoroutineT (forall r .
-       (forall u . f u -> (u -> r) -> r)
-    -> (b -> (a -> r) -> r)
-    -> (e -> r)
-    -> (t -> r)
-    -> r)
+newtype Suspend a b e q = Suspend {
+    runSuspend
+        :: (b -> Suspend a b e q -> q)
+        -> (e -> q)
+        -> (b -> q)
+        -> a
+        -> q}
 
 
-raise :: e -> CoroutineT a b e f t
-raise x = CoroutineT $ \_ _ onRaise _ -> do
-    onRaise x
+newtype Coroutine a b e q f t = Coroutine {
+    runc
+        :: (forall u . f u -> (u -> q) -> q)
+        -> (b -> Suspend a b e q -> q)
+        -> (e -> q)
+        -> (b -> q)
+        -> ((b -> Suspend a b e q -> q) -> (e -> q) -> (b -> q) -> e -> q)
+        -> ((b -> Suspend a b e q -> q) -> (e -> q) -> (b -> q) -> t -> q)
+        -> q}
 
 
-yield :: b -> CoroutineT a b e f a
-yield outv = CoroutineT $ \_ onYield _ onResult -> do
-    onYield outv onResult
+instance Functor (Coroutine a b e q f) where
+    fmap = liftM
 
 
-try :: CoroutineT a b e f t -> CoroutineT a b e f (Either e t)
-try (CoroutineT body) = CoroutineT $ \onLift onYield _ onResult -> do
-    body onLift onYield (onResult . Left) (onResult . Right)
-
-
-lift :: f t -> CoroutineT a b e f t
-lift act = CoroutineT $ \onLift _ _ onResult -> do
-    onLift act onResult
-
-
-instance Functor (CoroutineT a b e f) where
-    fmap f (CoroutineT body) = do
-        CoroutineT $ \onLift onYield onRaise onResult -> do
-            body onLift onYield onRaise (onResult . f)
-
-
-instance Applicative (CoroutineT a b e f) where
-    pure x = CoroutineT $ \_ _ _ onResult -> do
-        onResult x
+instance Applicative (Coroutine a b e q f) where
+    pure = return
     (<*>) = ap
 
 
-instance Monad (CoroutineT a b e f) where
-    return = pure
-    CoroutineT body1 >>= after = do
-        CoroutineT $ \onLift onYield onRaise onResult -> do
-            body1 onLift onYield onRaise $ \x ->
-                case x `seq` after x of
-                    CoroutineT body2 -> body2 onLift onYield onRaise onResult
+instance Monad (Coroutine a b e q f) where
+    return x = Coroutine $ \_ acYield acError acPure _ onPure -> do
+        onPure acYield acError acPure x
+    body1 >>= after = Coroutine $
+        \resolve acYield1 acError1 acPure1 onError onPure -> do
+            runc body1 resolve acYield1 acError1 acPure1 onError $
+                \acYield2 acError2 acPure2 x -> do
+                    runc (after x) resolve acYield2 acError2 acPure2
+                        onError onPure
 
 
-data Thread a b e f t where
-    Pure :: !t -> Thread a b e f t
-    Error :: !e -> Thread a b e f t
-    Yield :: !b -> (a -> Thread a b e f t) -> Thread a b e f t
-    Lift :: !(f u) -> (u -> Thread a b e f t) -> Thread a b e f t
+lift :: f t -> Coroutine a b e q f t
+lift box = Coroutine $ \resolve acYield acError acPure _ onPure -> do
+    resolve box $ onPure acYield acError acPure
 
 
-wrap
-    :: CoroutineT a b e f t
-    -> Thread a b e f t
-wrap (CoroutineT body) = do
-    body
-        Lift
-        Yield
-        Error
-        Pure
+yield :: b -> Coroutine a b e q f a
+yield outv = Coroutine $ \_ acYield _ _ _ onPure -> do
+    acYield outv $ Suspend onPure
+
+
+raise :: e -> Coroutine a b e q f t
+raise err = Coroutine $ \_ acYield acError acPure onError _ -> do
+    onError acYield acError acPure err
+
+
+catch
+    :: Coroutine a b e q f t
+    -> (e -> Coroutine a b e q f t)
+    -> Coroutine a b e q f t
+catch inner handler = Coroutine $
+    \resolve acYield1 acError1 acPure1 onError onPure -> do
+        runc inner resolve acYield1 acError1 acPure1
+            (\acYield2 acError2 acPure2 err -> do
+                runc (handler err) resolve acYield2 acError2 acPure2
+                    onError onPure)
+            onPure
+
+
+suspend
+    :: (a -> Coroutine a b e q f b)
+    -> Coroutine a b e q f (Suspend a b e q)
+suspend func = Coroutine $
+    \resolve acYield1 acError1 acPure1 _ onPure -> do
+        onPure acYield1 acError1 acPure1 $
+            Suspend $ \acYield2 acError2 acPure2 inv -> do
+                runc (func inv) resolve
+                    acYield2
+                    acError2
+                    acPure2
+                    (\_ acError3 _ err -> acError3 err)
+                    (\_ _ acPure3 x -> acPure3 x)
+
+
+resume
+    :: Suspend a b e q
+    -> (b -> Suspend a b e q -> Coroutine a b e q f t)
+    -> (e -> Coroutine a b e q f t)
+    -> (b -> Coroutine a b e q f t)
+    -> a
+    -> Coroutine a b e q f t
+resume state1 handleYield handleError handlePure inv = Coroutine $
+    \resolve acYield acError acPure onError onPure -> do
+        runSuspend state1
+            (\outv state2 -> runc (handleYield outv state2)
+                resolve acYield acError acPure onError onPure)
+            (\err -> runc (handleError err)
+                resolve acYield acError acPure onError onPure)
+            (\x -> runc (handlePure x)
+                resolve acYield acError acPure onError onPure)
+            inv
+
+
+execute
+    :: Coroutine a b e q f t
+    -> (forall u . f u -> (u -> q) -> q)
+    -> (e -> q)
+    -> (t -> q)
+    -> q
+execute body resolve handleError handlePure = do
+    runc body
+        resolve
+        (error "yield from the top level")
+        (error "never used")
+        (error "never used")
+        (\_ _ _ err -> handleError err)
+        (\_ _ _ x -> handlePure x)

@@ -4,8 +4,12 @@
 print('testing pattern matching')
 
 local function checkerror (msg, f, ...)
-  local s, err = pcall(f, ...)
-  assert(not s and string.find(err, msg))
+  local s, err = xpcall(f, nil, ...)
+  assert(not s)
+  if not string.find(err, msg) then
+    print(err, msg)
+    assert(false)
+  end
 end
 
 
@@ -230,12 +234,13 @@ assert(string.gsub("first second word", "%w+",
          function (w) t.n=t.n+1; t[t.n] = w end, 2) == "first second word")
 assert(t[1] == "first" and t[2] == "second" and t[3] == undef)
 
-checkerror("invalid replacement value %(a table%)",
+checkerror("Attempt to pass a table as a replacement value",
             string.gsub, "alo", ".", {a = {}})
-checkerror("invalid capture index %%2", string.gsub, "alo", ".", "%2")
-checkerror("invalid capture index %%0", string.gsub, "alo", "(%0)", "a")
-checkerror("invalid capture index %%1", string.gsub, "alo", "(%1)", "a")
-checkerror("invalid use of '%%'", string.gsub, "alo", ".", "%x")
+checkerror("Invalid capture index %%2", string.gsub, "alo", ".", "%2")
+checkerror("Invalid capture index %%0", string.gsub, "alo", "(%0)", "a")
+checkerror("Invalid capture index %%1", string.gsub, "alo", "(%1)", "a")
+checkerror("Invalid use of a %% in replacement string",
+            string.gsub, "alo", ".", "%x")
 
 
 if not _soft then
@@ -357,13 +362,16 @@ assert(#a == 0)
 
 -- malformed patterns
 local function malform (p, m)
-  m = m or "malformed"
-  local r, msg = pcall(string.find, "a", p)
-  assert(not r and string.find(msg, m))
+  m = m or "unexpected"
+  local r, msg = xpcall(string.find, nil, "a", p)
+  if not string.find(msg, m) then
+    print(msg, m)
+    assert(false)
+  end
 end
 
-malform("(.", "unfinished capture")
-malform(".)", "invalid pattern capture")
+malform("(.", "Unfinished capture")
+malform(".)", "Invalid pattern capture")
 malform("[a")
 malform("[]")
 malform("[^]")
@@ -372,7 +380,7 @@ malform("[a%")
 malform("%b")
 malform("%ba")
 malform("%")
-malform("%f", "missing")
+malform("%f")
 
 -- \0 in patterns
 assert(string.match("ab\0\1\2c", "[\0-\2]+") == "\0\1\2")
@@ -388,34 +396,34 @@ assert(string.find("abc\0\0","\0.") == 4)
 assert(string.find("abcx\0\0abc\0abc","x\0\0abc\0a.") == 4)
 
 
-do   -- test reuse of original string in gsub
-  local s = string.rep("a", 100)
-  local r = string.gsub(s, "b", "c")   -- no match
-  assert(string.format("%p", s) == string.format("%p", r))
+-- do   -- test reuse of original string in gsub
+  -- local s = string.rep("a", 100)
+  -- local r = string.gsub(s, "b", "c")   -- no match
+  -- assert(string.format("%p", s) == string.format("%p", r))
 
-  r = string.gsub(s, ".", {x = "y"})   -- no substitutions
-  assert(string.format("%p", s) == string.format("%p", r))
+  -- r = string.gsub(s, ".", {x = "y"})   -- no substitutions
+  -- assert(string.format("%p", s) == string.format("%p", r))
 
-  local count = 0
-  r = string.gsub(s, ".", function (x)
-                            assert(x == "a")
-                            count = count + 1
-                            return nil    -- no substitution
-                          end)
-  r = string.gsub(r, ".", {b = 'x'})   -- "a" is not a key; no subst.
-  assert(count == 100)
-  assert(string.format("%p", s) == string.format("%p", r))
+  -- local count = 0
+  -- r = string.gsub(s, ".", function (x)
+                            -- assert(x == "a")
+                            -- count = count + 1
+                            -- return nil    -- no substitution
+                          -- end)
+  -- r = string.gsub(r, ".", {b = 'x'})   -- "a" is not a key; no subst.
+  -- assert(count == 100)
+  -- assert(string.format("%p", s) == string.format("%p", r))
 
-  count = 0
-  r = string.gsub(s, ".", function (x)
-                            assert(x == "a")
-                            count = count + 1
-                            return x    -- substitution...
-                          end)
-  assert(count == 100)
+  -- count = 0
+  -- r = string.gsub(s, ".", function (x)
+                            -- assert(x == "a")
+                            -- count = count + 1
+                            -- return x    -- substitution...
+                          -- end)
+  -- assert(count == 100)
   -- no reuse in this case
-  assert(r == s and string.format("%p", s) ~= string.format("%p", r))
-end
+  -- assert(r == s and string.format("%p", s) ~= string.format("%p", r))
+-- end
 
 print('OK')
 
