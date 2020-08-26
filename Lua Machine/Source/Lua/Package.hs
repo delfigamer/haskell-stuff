@@ -69,8 +69,7 @@ lpkRequire loaded searchers name = do
                     LString msg:_ -> search (msg:errs) (n+1)
                     LNil:_ -> search errs (n+1)
                     [] -> search errs (n+1)
-                    _ -> do
-                        let lres:ldata:_ = luaExtend 2 srets
+                    lres :| ldata :| _ -> do
                         mrets <- luaCall lres [ldata]
                         let modvalue = case mrets of
                                 LNil:_ -> LBool True

@@ -250,7 +250,7 @@ local a,b = 1, {
   {1,2,3,4,5} or 3+3<=3+3,
   3+1>3+1,
   {d = x and aaa[x or y]}}
-]], "Attempt to call")
+]], "Attempt to index")
 
 checkmessage([[
 local x,y = {},1

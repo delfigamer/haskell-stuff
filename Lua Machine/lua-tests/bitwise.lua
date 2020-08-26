@@ -3,27 +3,31 @@
 
 print("testing bitwise operations")
 
-require "bwcoercion"
+-- require "bwcoercion"
 
 local numbits = string.packsize('j') * 8
 
+local function m(x)
+  return math.tointeger(x, numbits)
+end
+
 assert(~0 == -1)
 
-assert((1 << (numbits - 1)) == math.mininteger)
+assert(m(1 << (numbits - 1)) == m(math.mininteger))
 
 -- basic tests for bitwise operators;
 -- use variables to avoid constant folding
 local a, b, c, d
 a = 0xFFFFFFFFFFFFFFFF
-assert(a == -1 and a & -1 == a and a & 35 == 35)
+assert(a == m(-1) and a & -1 == a and a & 35 == 35)
 a = 0xF0F0F0F0F0F0F0F0
 assert(a | -1 == -1)
 assert(a ~ a == 0 and a ~ 0 == a and a ~ ~a == -1)
-assert(a >> 4 == ~a)
+assert(a >> 4 == m(~a))
 a = 0xF0; b = 0xCC; c = 0xAA; d = 0xFD
 assert(a | b ~ c & d == 0xF4)
 
-a = 0xF0.0; b = 0xCC.0; c = "0xAA.0"; d = "0xFD.0"
+a = 0xF0.0; b = 0xCC.0; c = m("0xAA.0"); d = m("0xFD.0")
 assert(a | b ~ c & d == 0xF4)
 
 a = 0xF0000000; b = 0xCC000000;
@@ -38,38 +42,38 @@ d = d << 32
 assert(a | b ~ c & d == 0xF4000000 << 32)
 assert(~~a == a and ~a == -1 ~ a and -d == ~d + 1)
 
-assert(-1 >> 1 == (1 << (numbits - 1)) - 1 and 1 << 31 == 0x80000000)
-assert(-1 >> (numbits - 1) == 1)
-assert(-1 >> numbits == 0 and
-       -1 >> -numbits == 0 and
-       -1 << numbits == 0 and
-       -1 << -numbits == 0)
+assert(m(-1) >> 1 == (1 << (numbits - 1)) - 1 and 1 << 31 == 0x80000000)
+assert(m(-1) >> (numbits - 1) == 1)
+assert(m(-1) >> numbits == 0 and
+       m(-1 >> -numbits) == 0 and
+       m(-1 << numbits) == 0 and
+       m(-1) << -numbits == 0)
 
-assert((2^30 - 1) << 2^30 == 0)
-assert((2^30 - 1) >> 2^30 == 0)
+assert(m((2^30 - 1) << 2^30) == 0)
+assert(m((2^30 - 1) >> 2^30) == 0)
 
 assert(1 >> -3 == 1 << 3 and 1000 >> 5 == 1000 << -5)
 
 
 -- coercion from strings to integers
-assert("0xffffffffffffffff" | 0 == -1)
-assert("0xfffffffffffffffe" & "-1" == -2)
-assert(" \t-0xfffffffffffffffe\n\t" & "-1" == 2)
-assert("   \n  -45  \t " >> "  -2  " == -45 * 4)
-assert("1234.0" << "5.0" == 1234 * 32)
-assert("0xffff.0" ~ "0xAAAA" == 0x5555)
-assert(~"0x0.000p4" == -1)
+assert(m"0xffffffffffffffff" | 0 == m(-1))
+assert(m"0xfffffffffffffffe" & m"-1" == m(-2))
+assert(m" \t-0xfffffffffffffffe\n\t" & m"-1" == 2)
+assert(m"   \n  -45  \t " >> m"  -2  " == m(-45) * 4)
+assert(m"1234.0" << m"5.0" == 1234 * 32)
+assert(m"0xffff.0" ~ m"0xAAAA" == 0x5555)
+assert(~m"0x0.000p4" == -1)
 
-assert(("7" .. 3) << 1 == 146)
-assert(0xffffffff >> (1 .. "9") == 0x1fff)
-assert(10 | (1 .. "9") == 27)
+assert(m("7" .. 3) << 1 == 146)
+assert(0xffffffff >> m(1 .. "9") == 0x1fff)
+assert(10 | m(1 .. "9") == 27)
 
 do
-  local st, msg = pcall(function () return 4 & "a" end)
-  assert(string.find(msg, "'band'"))
+  local st, msg = xpcall(function () return 4 & "a" end, nil)
+  assert(string.find(msg, "Attempt to perform arithmetic"))
 
-  local st, msg = pcall(function () return ~"a" end)
-  assert(string.find(msg, "'bnot'"))
+  local st, msg = xpcall(function () return ~"a" end, nil)
+  assert(string.find(msg, "Attempt to perform arithmetic"))
 end
 
 

@@ -23,6 +23,7 @@ module Lua.Core (
     errArgType,
     errDivideZero,
     errLenType,
+    errNanIndex,
     errNilIndex,
     errNoArg,
     errNonSuspended,
@@ -82,6 +83,7 @@ module Lua.Core (
     lxRawLen,
     lxRead,
     lxResume,
+    lxRunHook,
     lxRunT,
     lxSet,
     lxSetBoolMetatable,
@@ -146,6 +148,9 @@ errDivideZero = LString $ "Divide by zero"
 
 errLenType :: LuaValue q s
 errLenType = LString "Object length is not an integer"
+
+errNanIndex :: LuaValue q s
+errNanIndex = LString $ "Attempt to index a table with a NaN"
 
 errNilIndex :: LuaValue q s
 errNilIndex = LString $ "Attempt to index a table with a nil"
@@ -731,7 +736,8 @@ data LuaContext q s = LuaContext {
     lctxCurrentThread :: LuaValue q s,
     lctxStack :: ![LuaStackFrame q s],
     lctxStackInnerDepth :: !Int,
-    lctxOnClose :: !(LuaCloseChain q s)}
+    lctxOnClose :: !(LuaCloseChain q s),
+    lctxInsideHook :: !Bool}
 
 
 lctxModifyStack
@@ -803,7 +809,8 @@ lxRunT onST onIO onError onPure (LuaState lstate) = do
                     lctxCurrentThread = LThread (LuaId 1) (LuaThread pthread),
                     lctxStack = [],
                     lctxStackInnerDepth = 0,
-                    lctxOnClose = mempty}
+                    lctxOnClose = mempty,
+                    lctxInsideHook = False}
                 Y.execute (lstate ctx)
                     (\box cont -> do
                         case box of
@@ -1016,7 +1023,8 @@ lxNewThread func = do
             lctxCurrentThread = value,
             lctxStack = [],
             lctxStackInnerDepth = 1,
-            lctxOnClose = mempty}
+            lctxOnClose = mempty,
+            lctxInsideHook = False}
         result <- lstate $! ctx
         return $ (mempty, result)
     lxWrite pthread $ LTSuspended mempty suspended
@@ -1151,6 +1159,7 @@ lxAllocTable elems = do
         flip fix elems $ \loop elems1 -> do
             case elems1 of
                 (LNil, _):_ -> lxError $ errNilIndex
+                (LDouble d, _):_ | isNaN d -> lxError $ errNanIndex
                 (_, LNil):rest -> loop rest
                 (!kval, !vval):rest -> do
                     lxLiftST $ T.set body' (lxKey kval) (kval, vval)
@@ -1549,24 +1558,28 @@ lxRawArithMod a b def = do
         doRational
         doDouble
     where
-    doInteger x y =
-        if y == 0
-            then lxError $ errDivideZero
-            else return $ LInteger $ mod x y
-    doRational x y =
-        if y == 0
-            then doDouble (fromRational x) (fromRational y)
-            else return $ LRational $ x - y * fromInteger (floor (x / y))
-    doDouble x y =
-        return $ LDouble $
-            if isInfinite y
-                then if x >= 0 && y > 0 || x <= 0 && y < 0
-                    then x
-                    else y
-                else let r = x / y in
-                    if isNaN r || isInfinite r
-                        then (0/0)
-                        else x - y * fromInteger (floor r)
+    doInteger x y
+        | y == 0 = lxError $ errDivideZero
+        | otherwise = return $ LInteger $ mod x y
+    doRational x y = do
+        case rationalmod x y of
+            Nothing -> return $ LDouble $ 0/0
+            Just r -> return $ LRational $ r
+    doDouble x y
+        | isInfinite x || isNaN x || isNaN y = return $ LDouble $ 0/0
+        | isInfinite y = if x >= 0 && y > 0 || x <= 0 && y < 0
+            then return $ LDouble $ x
+            else return $ LDouble $ y
+        | otherwise = do
+            case rationalmod (toRational x) (toRational y) of
+                Nothing -> return $ LDouble $ 0/0
+                Just 0 -> if x < 0
+                    then return $ LDouble $ -0
+                    else return $ LDouble $ 0
+                Just r -> return $ LDouble $ fromRational r
+    rationalmod x y
+        | y == 0 = Nothing
+        | otherwise = Just $ x - y * toRational (floor (x / y) :: Integer)
 
 
 lxRawArithPow
@@ -1739,6 +1752,7 @@ lxGet a b = do
         LTable _ table -> do
             case b of
                 LNil -> metaGet $ return LNil
+                LDouble d | isNaN d -> metaGet $ return LNil
                 _ -> do
                     result <- lxTableGet table b
                     case result of
@@ -1760,6 +1774,7 @@ lxSet a b c = do
         LTable _ table -> do
             case b of
                 LNil -> metaSet $ lxError $ errNilIndex
+                LDouble d | isNaN d -> metaSet $ lxError $ errNanIndex
                 _ -> do
                     result <- lxTableGet table b
                     case result of
@@ -1786,6 +1801,15 @@ lxLocalStack
     -> LuaState q s t
 lxLocalStack func act = do
     lxLocalContext (lctxModifyStack func) act
+
+
+lxRunHook
+    :: LuaState q s ()
+    -> LuaState q s ()
+lxRunHook (LuaState act) = LuaState $ \ !ctx -> do
+    if lctxInsideHook ctx
+        then return ()
+        else act $ ctx {lctxInsideHook = True}
 
 
 lxCurrentThread

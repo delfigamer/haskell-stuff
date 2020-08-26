@@ -94,9 +94,12 @@ readFormatSlot = do
         | '0' `elem` flags = PTZero
         | otherwise = PTLeft
     readNum = do
-        first <- satisfy (\x -> '1' <= x && x <= '9')
-        rest <- many $ satisfy (\x -> '0' <= x && x <= '9')
-        return $ itos $ first:rest
+        first <- satisfy (\x -> '0' <= x && x <= '9')
+        if first == '0'
+            then return 0
+            else do
+                rest <- many $ satisfy (\x -> '0' <= x && x <= '9')
+                return $ itos $ first:rest
     itos digits
         | x > toInteger (maxBound :: Int) = maxBound :: Int
         | x < toInteger (minBound :: Int) = minBound :: Int
@@ -1075,8 +1078,16 @@ luaLexInteger buf base
         case str of
             c:rest | '\9' <= c && c <= '\13' -> readStart rest
             ' ':rest-> readStart rest
-            '-':rest -> readDigits (-1) 0 rest
-            rest -> readDigits 1 0 rest
+            '+':rest -> readFirst 1 rest
+            '-':rest -> readFirst (-1) rest
+            rest -> readFirst 1 rest
+
+    readFirst sign str = do
+        case str of
+            c:rest
+                | let d = digit c, d < base ->
+                    readDigits sign d rest
+            _ -> LNil
 
     readDigits sign num str = do
         case str of

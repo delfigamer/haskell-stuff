@@ -29,11 +29,11 @@ luadGetTraceback
     :: LuaState q s [(Maybe BSt.ByteString, Maybe SourceRange)]
 luadGetTraceback = do
     stack <- lxAskStack
-    forM stack (\frame -> do
+    forM stack $ \frame -> do
         let fname = snd <$> lsfDefinition frame
         let locref = lsfCurrentLocation frame
         loc <- lxRead locref
-        return $ (fname, loc))
+        return $ (fname, loc)
 
 
 luadGetStack :: LuaState q s [LuaStackFrame q s]
@@ -59,11 +59,11 @@ luadSetLocation mpr = do
             lxWrite locationRef mpr
         _ -> return ()
     (hookf, _, _, lineflag) <- lxGetDebugHook
-    when lineflag (do
+    when lineflag $ lxRunHook $ do
         let mline = do
             SourceRange (_, Just (srow, _, _, _)) <- mpr
             Just $ LInteger $ toInteger srow
-        () <$ lxCall hookf [LString "line", fromMaybe LNil mline])
+        () <$ lxCall hookf [LString "line", fromMaybe LNil mline]
 
 
 luadWithinLocal
@@ -97,13 +97,13 @@ luadRunFunction mdef upvalues args act = do
         lsfLocals = args}
     result <- lxStackLevel $ lxLocalStack (lstackFrame:) $ do
         (callhookf, callflag, _, _) <- lxGetDebugHook
-        when callflag (do
-            () <$ lxCall callhookf [LString "call"])
+        when callflag $ lxRunHook $ do
+            () <$ lxCall callhookf [LString "call"]
         result' <- act
         (rethookf, _, retflag, _) <- lxGetDebugHook
-        when retflag (do
+        when retflag $ lxRunHook $ do
             () <$ lxCall rethookf [
-                LString $ either (const "tail call") (const "return") result'])
+                LString $ either (const "tail call") (const "return") result']
         return $ result'
     case result of
         Left (tailfunc, args') -> tailfunc args'

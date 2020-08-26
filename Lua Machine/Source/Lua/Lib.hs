@@ -1,4 +1,5 @@
 {-# LANGUAGE BangPatterns #-}
+{-# LANGUAGE FlexibleContexts #-}
 {-# LANGUAGE FlexibleInstances #-}
 {-# LANGUAGE OverloadedStrings #-}
 
@@ -27,6 +28,7 @@ import GHC.Stats
 import System.CPUTime
 import System.Mem
 import System.Random.SplitMix
+import qualified Data.Array.ST as V
 import qualified Data.ByteString.Char8 as BSt
 import qualified Data.ByteString.Lazy.Char8 as B
 import Lua.Common
@@ -116,15 +118,13 @@ registerLib lib name env = do
 luaopenCoroutine :: LuaValue q s -> LuaState q s ()
 luaopenCoroutine env = do
     coroutine <- luaCreateTable =<< sequence [
-        makef "coroutine." "close" (\args -> do
-            let a:_ = luaExtend 1 args
+        makef "coroutine." "close" (\(a :| _) -> do
             co <- parseArg 1 "thread" luaToThread a
             merr <- luaThreadClose co
             case merr of
                 Nothing -> return $ [LBool True]
                 Just err -> return $ [LBool False, err]),
-        makef "coroutine." "create" (\args -> do
-            let a:_ = luaExtend 1 args
+        makef "coroutine." "create" (\(a :| _) -> do
             func <- parseArg 1 "function" luaToFunction a
             thread <- luaCreateThread func
             return $ [thread]),
@@ -137,8 +137,7 @@ luaopenCoroutine env = do
                 a:_ -> luaError $ errArgType 1 "thread" a
             isyieldable <- luaIsYieldable co
             return $ [LBool isyieldable]),
-        makef "coroutine." "resume" (\args -> do
-            let a:vals = luaExtend 1 args
+        makef "coroutine." "resume" (\(a :| vals) -> do
             co <- parseArg 1 "thread" luaToThread a
             rret <- luaResume co vals
             case rret of
@@ -147,8 +146,7 @@ luaopenCoroutine env = do
         makef "coroutine." "running" (\_ -> do
             (th, ismain) <- luaCurrentThread
             return $ [th, LBool ismain]),
-        makef "coroutine." "status" (\args -> do
-            let a:_= luaExtend 1 args
+        makef "coroutine." "status" (\(a :| _) -> do
             co <- parseArg 1 "thread" luaToThread a
             status <- luaThreadState co
                 (return "running")
@@ -156,12 +154,11 @@ luaopenCoroutine env = do
                 (return "normal")
                 (return "dead")
             return $ [LString status]),
-        makef "coroutine." "wrap" (\args -> do
-            let a:_ = luaExtend 1 args
+        makef "coroutine." "wrap" (\(a :| _) -> do
             func <- parseArg 1 "function" luaToFunction a
             ~(LThread _ co) <- luaCreateThread func
-            let resumer args' = do
-                rret <- luaResume co args'
+            let resumer args = do
+                rret <- luaResume co args
                 case rret of
                     Left err -> luaError $ err
                     Right rets -> return $ rets
@@ -250,8 +247,7 @@ luaopenDebug env = do
                             <> if retflag then "r" else ""
                             <> if lineflag then "l" else ""
                     return $ [hookf, LString mask]),
-        makef "debug." "getinfo" (\args -> do
-            let a:_ = luaExtend 1 args
+        makef "debug." "getinfo" (\(a :| _) -> do
             index <- parseArg 1 "integer" luaToInteger a
             stack <- luadGetStack
             case uncons $ drop (fromInteger index) $ stack of
@@ -290,15 +286,13 @@ luaopenDebug env = do
                                 _ -> return ()
                         _ -> return ()
                     return $ [info]),
-        makef "debug." "setcstacklimit" (\args -> do
-            let a:_ = luaExtend 1 args
+        makef "debug." "setcstacklimit" (\(a :| _) -> do
             newlimit <- parseArg 1 "integer" luaToInteger a
             moldlimit <- luadSetStackLimit $ fromInteger newlimit
             case moldlimit of
                 Nothing -> return $ [LBool False]
                 Just oldlimit -> return $ [LInteger $ toInteger oldlimit]),
-        makef "debug." "sethook" (\args -> do
-            let a:b:_ = luaExtend 2 args
+        makef "debug." "sethook" (\(a :| b :| _) -> do
             mhookf <- parseArgMaybe 1 "function" luaToFunction a
             mask <- parseArgDef 2 "string" luaToString "" b
             case mhookf of
@@ -312,12 +306,10 @@ luaopenDebug env = do
                             (a, callflag, returnflag, lineflag)
                         else luadSetDebugHook (LNil, False, False, False)
             return $ []),
-        makef "debug." "setmetatable" (\args -> do
-            let a:b:_ = luaExtend 2 args
+        makef "debug." "setmetatable" (\(a :| b :| _) -> do
             luadSetMetatable a b
             return $ [a]),
-        makef "debug." "traceback" (\args -> do
-            let a:b:_ = luaExtend 2 args
+        makef "debug." "traceback" (\(a :| b :| _) -> do
             case a of
                 LNil -> do
                     level <- parseArgDef 2 "integer" luaToInteger 1 b
@@ -354,22 +346,26 @@ mathFMod a b = do
         doRational
         doDouble
     where
-    doInteger x y =
-        if y == 0
-            then luaError $ errDivideZero
-            else return $ LInteger $ rem x y
-    doRational x y =
-        if y == 0
-            then doDouble (fromRational x) (fromRational y)
-            else return $ LRational $ x - y * fromInteger (truncate (x / y))
-    doDouble x y =
-        return $ LDouble $
-            if isInfinite y
-                then x
-                else let r = x / y in
-                    if isNaN r || isInfinite r
-                        then (0/0)
-                        else x - y * fromInteger (truncate r)
+    doInteger x y
+        | y == 0 = luaError $ errDivideZero
+        | otherwise = return $ LInteger $ rem x y
+    doRational x y = do
+        case rationalrem x y of
+            Nothing -> return $ LDouble $ 0/0
+            Just r -> return $ LRational $ r
+    doDouble x y
+        | isInfinite x || isNaN x || isNaN y = return $ LDouble $ 0/0
+        | isInfinite y = return $ LDouble $ x
+        | otherwise = do
+            case rationalrem (toRational x) (toRational y) of
+                Nothing -> return $ LDouble $ 0/0
+                Just 0 -> if x < 0
+                    then return $ LDouble $ -0
+                    else return $ LDouble $ 0
+                Just r -> return $ LDouble $ fromRational r
+    rationalrem x y
+        | y == 0 = Nothing
+        | otherwise = Just $ x - y * toRational (truncate (x / y) :: Integer)
 
 
 luaopenMath :: LuaValue q s -> LuaState q s ()
@@ -381,15 +377,25 @@ luaopenMath env = do
         Right g2 -> do
             luaAlloc $ g2
     math <- luaCreateTable =<< sequence [
-        makef "math." "abs" (\args -> do
-            let a:_ = luaExtend 1 args
+        makef "math." "abs" (\(a :| _) -> do
             luaToNumber a
                 (luaError $ errArgType 1 "number" a)
                 (\i -> return $ [LInteger $ abs i])
                 (\q -> return $ [LRational $ abs q])
                 (\d -> return $ [LDouble $ abs d])),
-        makef "math." "ceil" (\args -> do
-            let a:_ = luaExtend 1 args
+        makef "math." "acos" (\(a :| _) -> do
+            x <- parseArg 1 "number" luaToDouble a
+            return $ [LDouble $ acos x]),
+        makef "math." "asin" (\(a :| _) -> do
+            x <- parseArg 1 "number" luaToDouble a
+            return $ [LDouble $ asin x]),
+        makef "math." "atan" (\(a :| b :| _) -> do
+            x <- parseArg 1 "number" luaToDouble a
+            my <- parseArgMaybe 1 "number" luaToDouble b
+            case my of
+                Just y -> return $ [LDouble $ atan2 x y]
+                Nothing -> return $ [LDouble $ atan x]),
+        makef "math." "ceil" (\(a :| _) -> do
             luaToNumber a
                 (luaError $ errArgType 1 "number" a)
                 (\i -> return $ [LInteger i])
@@ -397,8 +403,13 @@ luaopenMath env = do
                 (\d -> if isNaN d || isInfinite d
                     then return $ [LDouble d]
                     else return $ [LInteger $ ceiling d])),
-        makef "math." "exact" (\args -> do
-            let a:_ = luaExtend 1 args
+        makef "math." "cos" (\(a :| _) -> do
+            x <- parseArg 1 "number" luaToDouble a
+            return $ [LDouble $ cos x]),
+        makef "math." "deg" (\(a :| _) -> do
+            x <- parseArg 1 "number" luaToDouble a
+            return $ [LDouble $ x * (180 / pi)]),
+        makef "math." "exact" (\(a :| _) -> do
             luaToNumber a
                 (luaError $ errArgType 1 "number" a)
                 (\i -> return $ [LInteger i])
@@ -412,8 +423,10 @@ luaopenMath env = do
                         if denominator q == 1
                             then return $ [LInteger $ numerator q]
                             else return $ [LRational $ q])),
-        makef "math." "floor" (\args -> do
-            let a:_ = luaExtend 1 args
+        makef "math." "exp" (\(a :| _) -> do
+            x <- parseArg 1 "number" luaToDouble a
+            return $ [LDouble $ exp x]),
+        makef "math." "floor" (\(a :| _) -> do
             luaToNumber a
                 (luaError $ errArgType 1 "number" a)
                 (\i -> return $ [LInteger i])
@@ -421,18 +434,22 @@ luaopenMath env = do
                 (\d -> if isNaN d || isInfinite d
                     then return $ [LDouble d]
                     else return $ [LInteger $ floor d])),
-        makef "math." "fmod" (\args -> do
-            let a:b:_ = luaExtend 2 args
+        makef "math." "fmod" (\(a :| b :| _) -> do
             r <- mathFMod a b
             return $ [r]),
         return $ (LString "huge", LDouble $ 1/0),
-        makef "math." "inexact" (\args -> do
-            let a:_ = luaExtend 1 args
+        makef "math." "inexact" (\(a :| _) -> do
             luaToNumber a
                 (luaError $ errArgType 1 "number" a)
                 (\i -> return $ [LDouble $ fromInteger i])
                 (\q -> return $ [LDouble $ fromRational q])
                 (\d -> return $ [LDouble d])),
+        makef "math." "log" (\(a :| b :| _) -> do
+            x <- parseArg 1 "number" luaToDouble a
+            my <- parseArgMaybe 1 "number" luaToDouble b
+            case my of
+                Just base -> return $ [LDouble $ logBase base x]
+                Nothing -> return $ [LDouble $ log x]),
         makef "math." "max" (\args -> do
             case args of
                 [] -> luaError $ LString "Expected any values, got none"
@@ -447,28 +464,68 @@ luaopenMath env = do
                         rest
                     return $ [r]),
         return $ (LString "maxinteger", LInteger $ 2 ^ (63::Int) - 1),
+        makef "math." "min" (\args -> do
+            case args of
+                [] -> luaError $ LString "Expected any values, got none"
+                first:rest -> do
+                    r <- foldM
+                        (\current next -> do
+                            lt <- luaCompareLt current next
+                            if lt
+                                then return $ current
+                                else return $ next)
+                        first
+                        rest
+                    return $ [r]),
         return $ (LString "mininteger", LInteger $ - 2 ^ (63::Int)),
+        makef "math." "modf" (\(a :| _) -> do
+            luaToNumber a
+                (luaError $ errArgType 1 "number" a)
+                (\i -> return $ [LInteger i, LRational 0])
+                (\q -> do
+                    let i = truncate q
+                    return $ [
+                        LInteger i,
+                        LRational $ q - fromInteger i])
+                (\d -> do
+                    if isNaN d
+                        then return $ [LDouble d, LDouble d]
+                        else if isInfinite d
+                            then return $ [LDouble d, LDouble 0]
+                            else do
+                                let i = truncate d
+                                return $ [
+                                    LInteger i,
+                                    LDouble $ d - fromInteger i])),
         return $ (LString "pi", LDouble $ pi),
+        makef "math." "rad" (\(a :| _) -> do
+            x <- parseArg 1 "number" luaToDouble a
+            return $ [LDouble $ x * (pi / 180)]),
         makef "math." "random" (\args -> do
-            let a:b:_ = luaExtend 2 args
             let advance genf wrapf = (do
                 (r, newst) <- genf <$> luaRead randomstate
                 luaWrite randomstate $ newst
                 return $ [wrapf r])
-            case (a, b) of
-                (LNil, LNil) -> do
+            case args of
+                [] -> do
                     advance nextDouble LDouble
-                (_, LNil) -> do
+                [a] -> do
                     upper <- parseArg 1 "integer" luaToInteger a
                     case upper of
-                        0 -> advance nextWord64 (LInteger . toInteger)
+                        0 -> advance nextWord64 $ \w -> do
+                            if w < 2^(63::Int)
+                                then LInteger $ toInteger w
+                                else LInteger $ toInteger w - 2^(64::Int)
                         _ -> advance (nextInteger 1 upper) LInteger
-                _ -> do
+                [a, b] -> do
                     lower <- parseArg 1 "integer" luaToInteger a
                     upper <- parseArg 2 "integer" luaToInteger b
-                    advance (nextInteger lower upper) LInteger),
-        makef "math." "randomseed" (\args -> do
-            let a:b:_ = luaExtend 2 args
+                    if lower <= upper
+                        then advance (nextInteger lower upper) LInteger
+                        else luaError $ LString "Interval is empty"
+                _ -> do
+                    luaError $ LString "Wrong number of arguments"),
+        makef "math." "randomseed" (\(a :| b :| _) -> do
             st <- case (a, b) of
                 (LNil, LNil) -> do
                     luaRead randomstate
@@ -485,23 +542,70 @@ luaopenMath env = do
             return $ [
                 LInteger $ toInteger s1,
                 LInteger $ toInteger s2]),
-        makef "math." "sin" (\args -> do
-            let a:_ = luaExtend 1 args
+        makef "math." "sin" (\(a :| _) -> do
             x <- parseArg 1 "number" luaToDouble a
             return $ [LDouble $ sin x]),
-        makef "math." "tointeger" (\args -> do
-            let a:_ = luaExtend 1 args
+        makef "math." "sqrt" (\(a :| _) -> do
+            luaToNumber a
+                (luaError $ errArgType 1 "number" a)
+                (\i -> case isqrt i of
+                    Just ir -> return $ [LInteger ir]
+                    Nothing -> return $ [LDouble $ sqrt $ fromInteger i])
+                (\q -> case (isqrt (numerator q), isqrt (denominator q)) of
+                    (Just nr, Just dr) -> return $ [LRational $ nr % dr]
+                    _ -> return $ [LDouble $ sqrt $ fromRational q])
+                (\d -> return $ [LDouble $ sqrt d])),
+        makef "math." "tan" (\(a :| _) -> do
+            x <- parseArg 1 "number" luaToDouble a
+            return $ [LDouble $ tan x]),
+        makef "math." "tointeger" (\(a :| b :| _) -> do
+            mbitlen <- parseArgMaybe 2 "integer" luaToInteger b
             case luaToInteger a of
-                Just i -> return $ [LInteger i]
+                Just i -> do
+                    case mbitlen of
+                        Nothing -> return $ [LInteger i]
+                        Just bitlen
+                            | bitlen == 0 -> do
+                                luaError $ errArgRange 2
+                            | bitlen < 0 -> do
+                                let halftop = 2 ^ (1 - bitlen)
+                                let top = 2 * halftop
+                                let mi = i `mod` top
+                                if mi < halftop
+                                    then return $ [LInteger $ mi]
+                                    else return $ [LInteger $ mi - top]
+                            | otherwise -> do
+                                return $ [LInteger $ i `mod` (2 ^ bitlen)]
                 Nothing -> return $ [LNil]),
-        makef "math." "type" (\args -> do
-            let a:_ = luaExtend 1 args
+        makef "math." "type" (\(a :| _) -> do
             case a of
                 LInteger _ -> return $ [LString "integer"]
                 LRational _ -> return $ [LString "float", LString "exact"]
                 LDouble _ -> return $ [LString "float", LString "inexact"]
-                _ -> return $ [LNil])]
+                _ -> return $ [LNil]),
+        makef "math." "ult" (\(a :| b :| _) -> do
+            x <- parseArg 1 "integer" luaToInteger a
+            y <- parseArg 2 "integer" luaToInteger b
+            return $ [LBool $ ult x y])]
     registerLib math "math" env
+    where
+    isqrt :: Integer -> Maybe Integer
+    isqrt x
+        | x < 0 = Nothing
+        | x == 0 = Just 0
+        | x == 1 = Just 1
+        | otherwise = bsearch 1 x
+        where
+        bsearch a b
+            | a >= b = Nothing
+            | otherwise = do
+                let m = (a + b) `div` 2
+                case compare (m*m) x of
+                    EQ -> Just m
+                    LT -> bsearch (m+1) b
+                    GT -> bsearch a m
+    ult :: Integer -> Integer -> Bool
+    ult x y = (0 <= x && (x < y || y < 0)) || (x < y && y < 0)
 
 
 newtype LuaUTCTime q s = LuaUTCTime UTCTime
@@ -520,6 +624,10 @@ luaopenOs env = do
             picosec <- luaLiftIO $ getCPUTime
             let sec = picosec % pico
             return $ [LRational sec]),
+        makef "os." "difftime" (\(a :| b :| _) -> do
+            LuaUTCTime ut2 <- parseArg 1 "time" luaToUserdata a
+            LuaUTCTime ut1 <- parseArg 2 "time" luaToUserdata b
+            return $ [LRational $ toRational $ diffUTCTime ut2 ut1]),
         makef "os." "setlocale" (\_ -> do
             return $ [LString "hs"]),
         makef "os." "time" (\_ -> do
@@ -659,8 +767,7 @@ gsubReplFunction func caps = do
 luaopenString :: LuaValue q s -> LuaState q s ()
 luaopenString env = do
     string <- luaCreateTable =<< sequence [
-        makef "string." "byte" (\args -> do
-            let a:b:c:_ = luaExtend 3 args
+        makef "string." "byte" (\(a :| b :| c :| _) -> do
             source <- parseArg 1 "string" luaToString a
             first <- parseArgDef 2 "integer" luaToInteger 1 b
             final <- parseArgDef 3 "integer" luaToInteger first c
@@ -678,32 +785,31 @@ luaopenString env = do
                 args
                 [1..]
             return $ [LString $ BSt.pack chars]),
-        makef "string." "find" (\args -> do
-            let a:b:c:d:_ = luaExtend 4 args
+        makef "string." "find" (\(a :| b :| c :| d :| _) -> do
             source <- parseArg 1 "string" luaToString a
-            pattern <- parseArg 2 "string" luaToString b
+            pat <- parseArg 2 "string" luaToString b
             first <- parseArgDef 3 "integer" luaToInteger 1 c
             let plain = luaToBoolean d
             let pos = stringOffset source first
             case () of
                 _
-                    | BSt.null pattern && pos <= BSt.length source -> do
+                    | BSt.null pat && pos <= BSt.length source -> do
                         return $ [pushInt (pos+1), pushInt pos]
-                    | BSt.null pattern -> do
+                    | BSt.null pat -> do
                         return $ [LNil]
                     | plain -> do
                         let sourcetail = BSt.drop pos $ source
-                        let (lsub, rsub) = BSt.breakSubstring pattern sourcetail
+                        let (lsub, rsub) = BSt.breakSubstring pat sourcetail
                         if BSt.null rsub
                             then return $ [LNil]
                             else do
                                 let offset = BSt.length lsub + pos
-                                let plen = BSt.length pattern
+                                let plen = BSt.length pat
                                 return $ [
                                     pushInt (offset+1),
                                     pushInt (offset+plen)]
                     | otherwise -> do
-                        parts <- luaBreakString False source pattern pos
+                        parts <- luaBreakString False source pat pos
                         case parts of
                             (Left before):(Right (LString sub:caps)):_ -> do
                                 let offset = BSt.length before
@@ -719,18 +825,16 @@ luaopenString env = do
                                     :pushInt plen
                                     :caps
                             _ -> return $ [LNil]),
-        makef "string." "format" (\args -> do
-            let a:rest = luaExtend 1 args
+        makef "string." "format" (\(a :| args) -> do
             fmt <- parseArg 1 "string" luaToString a
-            result <- luaFormat fmt rest
+            result <- luaFormat fmt args
             return $ [LString result]),
-        makef "string." "gmatch" (\args -> do
-            let a:b:c:_ = luaExtend 3 args
+        makef "string." "gmatch" (\(a :| b :| c :| _) -> do
             source <- parseArg 1 "string" luaToString a
-            pattern <- parseArg 2 "string" luaToString b
+            pat <- parseArg 2 "string" luaToString b
             first <- parseArgDef 3 "integer" luaToInteger 1 c
             let pos = stringOffset source first
-            parts <- luaBreakString True source pattern pos
+            parts <- luaBreakString True source pat pos
             matchesRef <- luaAlloc $ rights parts
             iterator <- luaCreateFunction (\_ -> do
                 matches <- luaRead matchesRef
@@ -743,10 +847,9 @@ luaopenString env = do
                             _:caps -> return $ caps
                             _ -> return $ [])
             return $ [iterator]),
-        makef "string." "gsub" (\args -> do
-            let a:b:c:d:_ = luaExtend 4 args
+        makef "string." "gsub" (\(a :| b :| c :| d :| _) -> do
             source <- parseArg 1 "string" luaToString a
-            pattern <- parseArg 2 "string" luaToString b
+            pat <- parseArg 2 "string" luaToString b
             repl <- case c of
                 LFunction _ ff -> return $ gsubReplFunction ff
                 LTable _ _ -> return $ gsubReplTable c
@@ -755,7 +858,7 @@ luaopenString env = do
                     | otherwise -> luaError $
                         errArgType 3 "string, function or table" c
             mlimit <- parseArgMaybe 4 "integer" luaToInteger d
-            allparts <- luaBreakString False source pattern 0
+            allparts <- luaBreakString False source pat 0
             let process parts count buf = do
                 case parts of
                     part:rest -> do
@@ -780,12 +883,10 @@ luaopenString env = do
                     [] -> return $ (buf [], count)
             (subs, count) <- process allparts 0 id
             return $ [LString $ BSt.concat $ subs, LInteger count]),
-        makef "string." "len" (\args -> do
-            let a:_ = luaExtend 1 args
+        makef "string." "len" (\(a :| _) -> do
             source <- parseArg 1 "string" luaToString a
             return $ [pushInt $ BSt.length source]),
-        makef "string." "lower" (\args -> do
-            let a:_ = luaExtend 1 args
+        makef "string." "lower" (\(a :| _) -> do
             source <- parseArg 1 "string" luaToString a
             let result = BSt.map
                     (\x ->
@@ -795,13 +896,12 @@ luaopenString env = do
                             else x)
                     source
             return $ [LString $ result]),
-        makef "string." "match" (\args -> do
-            let a:b:c:_ = luaExtend 3 args
+        makef "string." "match" (\(a :| b :| c :| _) -> do
             source <- parseArg 1 "string" luaToString a
-            pattern <- parseArg 2 "string" luaToString b
+            pat <- parseArg 2 "string" luaToString b
             first <- parseArgDef 3 "integer" luaToInteger 1 c
             let pos = stringOffset source first
-            parts <- luaBreakString False source pattern pos
+            parts <- luaBreakString False source pat pos
             case uncons $ rights parts of
                 Nothing -> return $ [LNil]
                 Just (match, _) -> do
@@ -809,20 +909,17 @@ luaopenString env = do
                         [cap] -> return $ [cap]
                         _:caps -> return $ caps
                         _ -> return $ [LNil]),
-        makef "string." "pack" (\args -> do
-            let a:vals = luaExtend 1 args
-            pattern <- parseArg 1 "string" luaToString a
-            case luaBinpackWrite pattern vals of
+        makef "string." "pack" (\(a :| vals) -> do
+            pat <- parseArg 1 "string" luaToString a
+            case luaBinpackWrite pat vals of
                 Left err -> luaError $ LString err
                 Right output -> return $ [LString output]),
-        makef "string." "packsize" (\args -> do
-            let a:_ = luaExtend 1 args
-            pattern <- parseArg 1 "string" luaToString a
-            case luaBinpackSize pattern of
+        makef "string." "packsize" (\(a :| _) -> do
+            pat <- parseArg 1 "string" luaToString a
+            case luaBinpackSize pat of
                 Left err -> luaError $ LString err
                 Right size -> return $ [LInteger $ toInteger size]),
-        makef "string." "rep" (\args -> do
-            let a:b:c:_ = luaExtend 3 args
+        makef "string." "rep" (\(a :| b :| c :| _) -> do
             source <- parseArg 1 "string" luaToString a
             count <- parseArg 2 "integer" luaToInteger b
             sep <- parseArgDef 3 "string" luaToString "" c
@@ -843,12 +940,10 @@ luaopenString env = do
                         | otherwise -> do
                             BSt.intercalate sep $ replicate icount $ source
             return $ [LString result]),
-        makef "string." "reverse" (\args -> do
-            let a:_ = luaExtend 3 args
+        makef "string." "reverse" (\(a :| _) -> do
             source <- parseArg 1 "string" luaToString a
             return $ [LString $ BSt.reverse source]),
-        makef "string." "sub" (\args -> do
-            let a:b:c:_ = luaExtend 3 args
+        makef "string." "sub" (\(a :| b :| c :| _) -> do
             source <- parseArg 1 "string" luaToString a
             first <- parseArg 2 "integer" luaToInteger b
             mfinal <- parseArgMaybe 3 "integer" luaToInteger c
@@ -861,18 +956,16 @@ luaopenString env = do
                         let epos = stringOffset source final + 1
                         BSt.drop spos $ BSt.take epos $ source
             return $ [LString result]),
-        makef "string." "unpack" (\args -> do
-            let a:b:c:_ = luaExtend 3 args
-            pattern <- parseArg 1 "string" luaToString a
+        makef "string." "unpack" (\(a :| b :| c :| _) -> do
+            pat <- parseArg 1 "string" luaToString a
             source <- parseArg 2 "string" luaToString b
             first <- parseArgDef 3 "integer" luaToInteger 1 c
             let spos = stringOffset source first
-            case luaBinpackRead pattern source spos of
+            case luaBinpackRead pat source spos of
                 Left err -> luaError $ LString err
                 Right (valbuf, epos) -> return $
                     valbuf [LInteger $ toInteger epos + 1]),
-        makef "string." "upper" (\args -> do
-            let a:_ = luaExtend 1 args
+        makef "string." "upper" (\(a :| _) -> do
             source <- parseArg 1 "string" luaToString a
             let result = BSt.map
                     (\x ->
@@ -900,11 +993,75 @@ integerLen list = do
         Nothing -> luaError $ errLenType
 
 
+heapSort
+    :: LuaValue q s
+    -> Int
+    -> (LuaValue q s -> LuaValue q s -> LuaState q s Bool)
+    -> LuaState q s ()
+heapSort list len lessM = do
+    if len <= 1
+        then return ()
+        else do
+            arr <- makeArray
+            doSort arr
+    where
+    makeArray :: LuaState q s (V.STArray s Int (LuaValue q s))
+    makeArray = do
+        luaLiftST $ V.newArray_ (1, len)
+    doSort arr = do
+        forM_ [1..len] $ \i -> do
+            x <- luaGet list (LInteger $ toInteger i)
+            heapascend i x
+        forM_ (zip [1..] [len, len-1 .. 2]) $ \(i, maxi) -> do
+            top <- geta 1
+            end <- geta maxi
+            luaSet list (LInteger i) top
+            heapdescend (maxi - 1) 1 end
+        top <- geta 1
+        luaSet list (LInteger $ toInteger len) top
+        where
+        heapascend i x
+            | i > 1 = do
+                let pari = i `div` 2
+                parx <- geta pari
+                lt <- lessM x parx
+                if lt
+                    then seta i parx >> heapascend pari x
+                    else seta i x
+            | otherwise = seta i x
+        heapdescend maxi i x
+            | chi > maxi = seta i x
+            | chi == maxi = do
+                chx <- geta chi
+                lt <- lessM chx x
+                if lt
+                    then seta i chx >> seta chi x
+                    else seta i x
+            | otherwise = do
+                chx1 <- geta chi
+                chx2 <- geta (chi + 1)
+                lt1 <- lessM chx1 x
+                if lt1
+                    then do
+                        lt2 <- lessM chx1 chx2
+                        if lt2
+                            then seta i chx1 >> heapdescend maxi chi x
+                            else seta i chx2 >> heapdescend maxi (chi + 1) x
+                    else do
+                        lt2 <- lessM chx2 x
+                        if lt2
+                            then seta i chx2 >> heapdescend maxi (chi + 1) x
+                            else seta i x
+            where
+            chi = 2 * i
+        geta i = luaLiftST $ V.readArray arr i
+        seta i x = luaLiftST $ V.writeArray arr i x
+
+
 luaopenTable :: LuaValue q s -> LuaState q s ()
 luaopenTable env = do
     table <- luaCreateTable =<< sequence [
-        makef "table." "concat" (\args -> do
-            let list:b:c:d:_ = luaExtend 4 args
+        makef "table." "concat" (\(list :| b :| c :| d :| _) -> do
             sep <- case b of
                 LNil -> return ""
                 _ -> luaAsString b
@@ -929,12 +1086,13 @@ luaopenTable env = do
                 [list, b] -> do
                     len <- integerLen list
                     return $ (list, len, len+1, b)
-                list:a:b:_ -> do
+                [list, a, b] -> do
                     len <- integerLen list
                     pos <- parseArg 2 "integer" luaToInteger a
                     unless (1 <= pos && pos <= (len + 1)) $
                         luaError $ errArgRange 2
                     return $ (list, len, pos, b)
+                _ -> luaError $ LString "Wrong number of arguments"
             flip fix len $ \loop i -> do
                 if i < pos
                     then return ()
@@ -944,13 +1102,27 @@ luaopenTable env = do
                         loop $ i-1
             luaSet list (LInteger pos) value
             return $ []),
+        makef "table." "move" (\(source :| b :| c :| d :| e :| _) -> do
+            firstn <- parseArg 2 "integer" luaToInteger b
+            lastn <- parseArg 3 "integer" luaToInteger c
+            finaln <- parseArg 4 "integer" luaToInteger d
+            let shift = finaln - firstn
+            let target = case e of
+                    LNil -> source
+                    _ -> e
+            let indices = if shift <= 0
+                    then [firstn .. lastn]
+                    else [lastn, lastn-1 .. firstn]
+            forM_ indices $ \i -> do
+                value <- luaGet source (LInteger i)
+                luaSet target (LInteger $ i + shift) $ value
+            return $ [target]),
         makef "table." "pack" (\args -> do
             let keys = map LInteger [1..]
             result <- luaCreateTable $ zip keys args
             luaSet result (LString "n") (LInteger $ toInteger $ length args)
             return $ [result]),
-        makef "table." "remove" (\args -> do
-            let list:b:_ = luaExtend 2 args
+        makef "table." "remove" (\(list :| b :| _) -> do
             len <- integerLen list
             pos <- parseArgDef 2 "integer" luaToInteger len b
             unless (False
@@ -966,8 +1138,7 @@ luaopenTable env = do
                         luaSet list (LInteger i) next
                         loop $ i+1
             return $ [value]),
-        makef "table." "sort" (\args -> do
-            let list:b:_ = luaExtend 2 args
+        makef "table." "sort" (\(list :| b :| _) -> do
             let comparer = case b of
                     LNil -> luaCompareLt
                     _ -> \x y -> do
@@ -976,29 +1147,18 @@ luaopenTable env = do
                             [] -> return $ False
                             r:_ -> return $ luaToBoolean r
             len <- integerLen list
-            listelems <- forM [1..len] $ \i -> luaGet list (LInteger i)
-            sorted <- flip fix listelems $ \rec elems -> do
-                case elems of
-                    [] -> return $ []
-                    pivot:rest -> do
-                        prest <- forM rest $ \el -> do
-                            cr <- comparer el pivot
-                            if cr
-                                then return $ Left el
-                                else return $ Right el
-                        let (less, greater) = partitionEithers prest
-                        left <- rec less
-                        right <- rec greater
-                        return $ left ++ [pivot] ++ right
-            zipWithM_ (\i el -> luaSet list (LInteger i) el) [1..] sorted
+            when (len > 2^(30::Int)) $
+                luaError $ LString "Array is too big"
+            heapSort list (fromInteger len) comparer
             return $ []),
-        makef "table." "unpack" (\args -> do
-            let list:b:c:_ = luaExtend 3 args
+        makef "table." "unpack" (\(list :| b :| c :| _) -> do
             first <- parseArgDef 3 "integer" luaToInteger 1 b
             mlast <- parseArgMaybe 4 "integer" luaToInteger c
             lastn <- case mlast of
                 Just i -> return $ i
                 Nothing -> integerLen list
+            when (lastn - first > 1000000) $
+                luaError $ LString "Too many results"
             elems <- forM [first..lastn] (\i -> luaGet list (LInteger i))
             return $ elems)]
     registerLib table "table" env
@@ -1017,16 +1177,14 @@ lualibBase = do
     preload <- luaNewTable
     luaSet package (LString "preload") preload
     searchers <- luaCreateTable =<< sequence [
-        makefi 1 "package.loaders[1]" (\args -> do
-            let a:_ = luaExtend 1 args
+        makefi 1 "package.loaders[1]" (\(a :| _) -> do
             preloadfunc <- luaRawGet preload a
             case preloadfunc of
                 LNil -> return $ [LString $
                     "\nNo field package.preload["
                         <> BSt.pack (show a) <> "]"]
                 _ -> return $ [preloadfunc, a]),
-        makefi 2 "package.loaders[2]" (\args -> do
-            let a:_ = luaExtend 1 args
+        makefi 2 "package.loaders[2]" (\(a :| _) -> do
             case luaToString a of
                 Nothing -> return $ [LString "Module name is not a string"]
                 Just name -> do
@@ -1044,8 +1202,7 @@ lualibBase = do
                                 Right chunk -> return $ [chunk, a])]
     luaSet package (LString "searchers") searchers
     uncurry (luaSet package) =<<
-        makef "package." "searchpath" (\args -> do
-            let a:b:c:d:e:_ = luaExtend 5 args
+        makef "package." "searchpath" (\(a :| b :| c :| d :| e :| _) -> do
             name <- parseArg 1 "string" luaToString a
             path <- parseArg 2 "string" luaToString b
             sep <- parseArgDef 3 "string" luaToString "." c
@@ -1068,8 +1225,7 @@ lualibBase = do
                     | luaToBoolean r -> return $ args
                     | otherwise -> luaError e)
     uncurry (luaSet env) =<<
-        makef "" "collectgarbage" (\args -> do
-            let a:_ = luaExtend 1 args
+        makef "" "collectgarbage" (\(a :| _) -> do
             case a of
                 LString "collect" -> do
                     luaLiftST $ unsafeIOToST $ performMajorGC
@@ -1093,22 +1249,19 @@ lualibBase = do
                     return $ [LBool True]
                 _ -> luaError $ LString "Invalid option")
     uncurry (luaSet env) =<<
-        makef "" "dofile" (\args -> do
-            let a:as = luaExtend 1 args
+        makef "" "dofile" (\(a :| args) -> do
             sourcename <- parseArg 1 "string" luaToString a
             prefix <- luaAsString =<< luaRawGet package (LString "prefix")
             let fname = BSt.unpack $ prefix <> sourcename
             lret <- luaLoadFile fname env
             case lret of
                 Left err -> luaError $ err
-                Right chunk -> luaCall chunk as)
+                Right chunk -> luaCall chunk args)
     uncurry (luaSet env) =<<
-        makef "" "error" (\args -> do
-            let e:_ = luaExtend 1 args
+        makef "" "error" (\(e :| _) -> do
             luaError e)
     uncurry (luaSet env) =<<
-        makef "" "getmetatable" (\args -> do
-            let a:_ = luaExtend 1 args
+        makef "" "getmetatable" (\(a :| _) -> do
             mt <- luaGetMetatable a
             case mt of
                 LTable _ _ -> do
@@ -1117,8 +1270,7 @@ lualibBase = do
                         LNil -> return $ [mt]
                         _ -> return $ [mt2]
                 _ -> return $ [mt])
-    inext <- luaCreateFunction (\args -> do
-        let list:b:_ = luaExtend 2 args
+    inext <- luaCreateFunction (\(list :| b :| _) -> do
         index <- parseArg 2 "integer" luaToInteger b
         let nexti = LInteger $ index + 1
         value <- luaGet list nexti
@@ -1126,15 +1278,13 @@ lualibBase = do
             LNil -> return $ []
             _ -> return $ [nexti, value])
     uncurry (luaSet env) =<<
-        makef "" "ipairs" (\args -> do
-            let list:_ = luaExtend 1 args
+        makef "" "ipairs" (\(list :| _) -> do
             case list of
                 LNil -> luaError $ errArgType 1 "table" list
                 _ -> return ()
             return $ [inext, list, LInteger 0])
     uncurry (luaSet env) =<<
-        makef "" "load" (\args -> do
-            let a:b:c:cs = luaExtend 3 args
+        makef "" "load" (\(a :| b :| c :| cs) -> do
             esource <- case a of
                 LString bstr -> return $ Right $ B.fromStrict bstr
                 LFunction _ ff -> luaTry $ lpkLoadSource ff
@@ -1152,8 +1302,7 @@ lualibBase = do
                         Left err -> return $ [LNil, err]
                         Right chunk -> return $ [chunk])
     uncurry (luaSet env) =<<
-        makef "" "loadfile" (\args -> do
-            let a:b:bs = luaExtend 2 args
+        makef "" "loadfile" (\(a :| b :| bs) -> do
             sourcename <- parseArg 1 "string" luaToString a
             prefix <- luaAsString =<< luaRawGet package (LString "prefix")
             _mode <- parseArgDef 2 "string" luaToString "" b
@@ -1166,8 +1315,7 @@ lualibBase = do
                 Left err -> return $ [LNil, err]
                 Right chunk -> return $ [chunk])
     uncurry (luaSet env) =<<
-        makef "" "pairs" (\args -> do
-            let list:_ = luaExtend 1 args
+        makef "" "pairs" (\(list :| _) -> do
             case list of
                 LTable _ _ -> return ()
                 _ -> luaError $ errArgType 1 "table" list
@@ -1187,9 +1335,8 @@ lualibBase = do
                                 return $ [key, value]))
                     return $ [stepfunc])
     uncurry (luaSet env) =<<
-        makef "" "pcall" (\args -> do
-            let a:as = luaExtend 1 args
-            res <- luaTry $ luaCall a as
+        makef "" "pcall" (\(a :| args) -> do
+            res <- luaTry $ luaCall a args
             case res of
                 Left err -> return $ [LBool False, err]
                 Right rets -> return $ LBool True:rets)
@@ -1200,52 +1347,45 @@ lualibBase = do
             luaLiftIO $ putStrLn $ line
             return $ [])
     uncurry (luaSet env) =<<
-        makef "" "rawequal" (\args -> do
-            let a:b:_ = luaExtend 2 args
+        makef "" "rawequal" (\(a :| b :| _) -> do
             eq <- luaRawEqual a b
             return $ [LBool $ eq])
     uncurry (luaSet env) =<<
-        makef "" "rawget" (\args -> do
-            let t:k:_ = luaExtend 2 args
+        makef "" "rawget" (\(t :| k :| _) -> do
             v <- luaRawGet t k
             return $ [v])
     uncurry (luaSet env) =<<
-        makef "" "rawlen" (\args -> do
-            let t:_ = luaExtend 1 args
+        makef "" "rawlen" (\(t :| _) -> do
             len <- luaRawLen t
             return $ [LInteger $ len])
     uncurry (luaSet env) =<<
-        makef "" "rawset" (\args -> do
-            let t:k:v:_ = luaExtend 3 args
+        makef "" "rawset" (\(t :| k :| v :| _) -> do
             luaRawSet t k v
             return $ [])
     uncurry (luaSet env) =<<
-        makef "" "require" (\args -> do
-            let a:_ = luaExtend 1 args
+        makef "" "require" (\(a :| _) -> do
             _ <- parseArg 1 "string" luaToString a
             modvalue <- lpkRequire loaded searchers a
             return $ [modvalue])
     uncurry (luaSet env) =<<
-        makef "" "select" (\args -> do
-            let a:rest = luaExtend 1 args
+        makef "" "select" (\(a :| args) -> do
             case a of
                 LString "#" -> do
-                    return $ [LInteger $ toInteger $ length $ rest]
+                    return $ [LInteger $ toInteger $ length $ args]
                 _ -> do
                     idx <- parseArg 1 "integer" luaToInteger a
                     case idx of
                         _
                             | idx > 0 -> do
-                                return $ drop (fromInteger idx - 1) $ rest
+                                return $ drop (fromInteger idx - 1) $ args
                             | idx < 0
-                            , let revl = length rest + fromInteger idx
+                            , let revl = length args + fromInteger idx
                             , revl >= 0 -> do
-                                return $ drop revl $ rest
+                                return $ drop revl $ args
                             | otherwise -> do
                                 luaError $ errArgRange 1)
     uncurry (luaSet env) =<<
-        makef "" "setmetatable" (\args -> do
-            let a:b:_ = luaExtend 2 args
+        makef "" "setmetatable" (\(a :| b :| _) -> do
             mt <- luaGetMetatable a
             case mt of
                 LTable _ _ -> do
@@ -1274,8 +1414,8 @@ lualibBase = do
                         LDouble _ -> return $ [a]
                         LString str -> return $ [luaLexNumber str]
                         _ -> return $ [LNil]
-                a:as -> do
-                    let b:_ = luaExtend 1 as
+                _ -> do
+                    let a :| b :| _ = args
                     mbase <- parseArgMaybe 2 "integer" luaToInteger b
                     case mbase of
                         Just base -> do
@@ -1302,13 +1442,11 @@ lualibBase = do
                 a:_ -> return $ [LString $ luaTypename a]
                 _ -> luaError $ LString "Expected a value, none was given")
     uncurry (luaSet env) =<<
-        makef "" "warn" (\args -> do
-            let a:_ = luaExtend 1 args
+        makef "" "warn" (\(a :| _) -> do
             luaWarn a
             return $ [])
     uncurry (luaSet env) =<<
-        makef "" "xpcall" (\args -> do
-            let a:b:as = luaExtend 2 args
+        makef "" "xpcall" (\(a :| b :| args) -> do
             mhandler <- parseArgMaybe 2 "function" luaToFunction b
             let errh = case mhandler of
                     Just ff -> \e -> do
@@ -1318,7 +1456,7 @@ lualibBase = do
                             r:_ -> return $ r
                             _ -> return $ e
                     Nothing -> return
-            res <- luaWithErrHandler errh $ luaTry $ luaCall a as
+            res <- luaWithErrHandler errh $ luaTry $ luaCall a args
             case res of
                 Left err -> return $ [LBool False, err]
                 Right rets -> return $ LBool True:rets)

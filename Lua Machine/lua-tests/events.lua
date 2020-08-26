@@ -449,8 +449,6 @@ assert(nil + nil == 3)
 debug.setmetatable(nil, nil)
 assert(getmetatable(nil) == nil)
 
-debug.setmetatable(nil, {})
-
 
 -- loops in delegation
 a = {}; setmetatable(a, a); a.__index = a; a.__newindex = a
@@ -471,6 +469,7 @@ child.foo = 10      --> CRASH (on some machines)
 assert(T == parent and K == "foo" and V == 10)
 
 print 'OK'
+
 
 return 12
 

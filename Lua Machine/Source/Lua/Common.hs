@@ -1,8 +1,10 @@
-{-# LANGUAGE RankNTypes #-}
+{-# LANGUAGE GADTs #-}
 {-# LANGUAGE FlexibleContexts #-}
 {-# LANGUAGE FlexibleInstances #-}
-{-# LANGUAGE GADTs #-}
+{-# LANGUAGE PatternSynonyms #-}
+{-# LANGUAGE RankNTypes #-}
 {-# LANGUAGE TypeOperators #-}
+{-# LANGUAGE ViewPatterns #-}
 
 
 module Lua.Common (
@@ -20,6 +22,7 @@ module Lua.Common (
     errArgType,
     errDivideZero,
     errLenType,
+    errNanIndex,
     errNilIndex,
     errNoArg,
     errNonSuspended,
@@ -70,7 +73,6 @@ module Lua.Common (
     luaCreateUserdata,
     luaCurrentThread,
     luaError,
-    luaExtend,
     luaFromUserdata,
     luaGet,
     luaGetMetatable,
@@ -120,12 +122,14 @@ module Lua.Common (
     luaToUserdata,
     luaTry,
     luaTypename,
+    luaUncons,
     luaWarn,
     luaWithErrHandler,
     luaWrite,
     luaXPCall,
     luaXTry,
     luaYield,
+    pattern (:|),
 ) where
 
 
@@ -329,10 +333,6 @@ luaError :: LuaValue q s -> LuaState q s a
 luaError e = lxError e
 
 
-luaExtend :: Int -> [LuaValue q s] -> [LuaValue q s]
-luaExtend n as = lxExtend n as
-
-
 luaFromUserdata
     :: LuaValue q s
     -> (forall t . (LuaMetatype t) => t q s -> LuaState q s u)
@@ -421,10 +421,12 @@ luaLexNumber buf = do
                 readExponentThen sign ipart fpart ebase False
             rest -> readInteger 10 rest $
                 readExponentThen sign ipart fpart ebase True
-    readExponentThen sign ipart fpart ebase esign (enum, _) str = do
-        if esign
-            then readEnd sign ipart fpart (Just (ebase^enum, 1)) str
-            else readEnd sign ipart fpart (Just (1, ebase^enum)) str
+    readExponentThen sign ipart fpart ebase esign (enum, eden) str = do
+        if eden == 1
+            then LNil
+            else if esign
+                then readEnd sign ipart fpart (Just (ebase^enum, 1)) str
+                else readEnd sign ipart fpart (Just (1, ebase^enum)) str
     readEnd sign ipart@(inum, iden) fpart epart str = do
         case str of
             "" -> case (fpart, epart) of
@@ -628,6 +630,7 @@ luaRawGet a b = do
         LTable _ table -> do
             case b of
                 LNil -> return $ LNil
+                LDouble d | isNaN d -> return $ LNil
                 _ -> lxTableGet table b
         _ -> lxError $ errWrongTable a
 
@@ -650,6 +653,7 @@ luaRawSet a b c = do
         LTable _ table -> do
             case b of
                 LNil -> lxError $ errNilIndex
+                LDouble d | isNaN d -> lxError $ errNanIndex
                 _ -> lxTableSet table b c
         _ -> lxError $ errWrongTable a
 
@@ -976,6 +980,14 @@ luaTypename
 luaTypename = lvalTypename
 
 
+luaUncons
+    :: [LuaValue q s]
+    -> (LuaValue q s, [LuaValue q s])
+luaUncons xs = case xs of
+    [] -> (LNil, [])
+    a:r -> (a, r)
+
+
 luaWarn
     :: LuaValue q s
     -> LuaState q s ()
@@ -1016,3 +1028,11 @@ luaYield
     :: [LuaValue q s]
     -> LuaState q s [LuaValue q s]
 luaYield = lxYield
+
+
+{-# COMPLETE (:|) #-}
+infixr 5 :|
+pattern (:|) :: LuaValue q s -> [LuaValue q s] -> [LuaValue q s]
+pattern (:|) a r <- (luaUncons -> (a, r))
+    where
+    a :| r = a:r
