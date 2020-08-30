@@ -352,7 +352,7 @@ luaLoadFile
     -> LuaValue q s
     -> LuaState q s (Either (LuaValue q s) (LuaValue q s))
 luaLoadFile filename fenv = do
-    ioret <- luaTry $ luaLiftIO $ B.readFile filename
+    ioret <- luaTryNoTrace $ luaLiftIO $ B.readFile filename
     case ioret of
         Left err -> return $ Left err
         Right source -> do

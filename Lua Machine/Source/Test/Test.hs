@@ -2,9 +2,10 @@
 {-# LANGUAGE RankNTypes #-}
 
 
-module TestLua (
+module Test.Test (
     testLua,
     runLua,
+    runLuaA,
 ) where
 
 

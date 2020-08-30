@@ -637,9 +637,10 @@ luaopenOs env = do
     registerLib os "os" env
 
 
-data LuaMetaString q s = LuaMetaString
-    (LuaValue q s)
-    BSt.ByteString
+newtype LuaStringProto q s = LuaStringProto (LuaValue q s)
+
+
+newtype LuaMetaString q s = LuaMetaString BSt.ByteString
 
 
 metaStringUnary
@@ -647,7 +648,7 @@ metaStringUnary
     -> LuaMetaString q s
     -> LuaState q s t
     -> LuaState q s t
-metaStringUnary op (LuaMetaString _ str) def = do
+metaStringUnary op (LuaMetaString str) def = do
     let av = luaLexNumber str
     if luaIsNumber av
         then op av
@@ -661,7 +662,7 @@ metaStringBinary
     -> Bool
     -> LuaState q s t
     -> LuaState q s t
-metaStringBinary op (LuaMetaString _ str) other rev def = do
+metaStringBinary op (LuaMetaString str) other rev def = do
     let av = luaLexNumber str
     if luaIsNumber av
         then do
@@ -687,8 +688,11 @@ instance LuaMetatype LuaMetaString where
     lmtPow = metaStringBinary luaArithPow
     lmtUnm = metaStringUnary luaArithUnm
     lmtIDiv = metaStringBinary luaArithIDiv
-    lmtIndex (LuaMetaString slib _) index _ = do
-        luaGet slib index
+    lmtIndex _ index def = do
+        mproto <- luaRegistryGet
+        case mproto of
+            Nothing -> def
+            Just (LuaStringProto proto) -> luaGet proto index
 
 
 gsubReplString
@@ -975,7 +979,8 @@ luaopenString env = do
                             else x)
                     source
             return $ [LString $ result])]
-    luaSetStringMetatype $ LuaMetaString string
+    luaSetStringMetatype $ LuaMetaString
+    luaRegistrySet $ Just $ LuaStringProto string
     registerLib string "string" env
     where
     stringOffset source n
@@ -1258,8 +1263,11 @@ lualibBase = do
                 Left err -> luaError $ err
                 Right chunk -> luaCall chunk args)
     uncurry (luaSet env) =<<
-        makef "" "error" (\(e :| _) -> do
-            luaError e)
+        makef "" "error" (\(e :| b :| _) -> do
+            mlv <- parseArgMaybe 2 "integer" luaToInteger b
+            case mlv of
+                Nothing -> luaError e
+                Just lv -> luaErrorAt (fromInteger lv) e)
     uncurry (luaSet env) =<<
         makef "" "getmetatable" (\(a :| _) -> do
             mt <- luaGetMetatable a
@@ -1439,7 +1447,19 @@ lualibBase = do
     uncurry (luaSet env) =<<
         makef "" "type" (\args -> do
             case args of
-                a:_ -> return $ [LString $ luaTypename a]
+                LNil:_ -> return $ [LString "nil"]
+                LBool _:_ -> return $ [LString "boolean"]
+                LInteger _:_ -> return $ [LString "number", LString "integer"]
+                LRational _:_ -> return $ [LString "number", LString "exact"]
+                LDouble _:_ -> return $ [LString "number", LString "inexact"]
+                LString _:_ -> return $ [LString "string"]
+                LFunction _ _:_ -> return $ [LString "function"]
+                LThread _ _:_ -> return $ [LString "thread"]
+                LTable _ _:_ -> return $ [LString "table"]
+                LUserdata _ x:_ -> do
+                    case lmtTypename x of
+                        Nothing -> return $ [LString "userdata"]
+                        Just tn -> return $ [LString "userdata", LString tn]
                 _ -> luaError $ LString "Expected a value, none was given")
     uncurry (luaSet env) =<<
         makef "" "warn" (\(a :| _) -> do

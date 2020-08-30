@@ -1,3 +1,4 @@
+{-# LANGUAGE BangPatterns #-}
 {-# LANGUAGE GADTs #-}
 {-# LANGUAGE FlexibleContexts #-}
 {-# LANGUAGE FlexibleInstances #-}
@@ -73,6 +74,7 @@ module Lua.Common (
     luaCreateUserdata,
     luaCurrentThread,
     luaError,
+    luaErrorAt,
     luaFromUserdata,
     luaGet,
     luaGetMetatable,
@@ -80,6 +82,7 @@ module Lua.Common (
     luaIsYieldable,
     luaLen,
     luaLexNumber,
+    luaLexNumberS,
     luaLiftIO,
     luaLiftST,
     luaNewTable,
@@ -93,6 +96,8 @@ module Lua.Common (
     luaRawLen,
     luaRawSet,
     luaRead,
+    luaRegistryGet,
+    luaRegistrySet,
     luaResume,
     luaRunIO,
     luaRunST,
@@ -121,6 +126,7 @@ module Lua.Common (
     luaToThread,
     luaToUserdata,
     luaTry,
+    luaTryNoTrace,
     luaTypename,
     luaUncons,
     luaWarn,
@@ -330,7 +336,11 @@ luaCurrentThread = lxCurrentThread
 
 
 luaError :: LuaValue q s -> LuaState q s a
-luaError e = lxError e
+luaError = lxError
+
+
+luaErrorAt :: Int -> LuaValue q s -> LuaState q s a
+luaErrorAt = lxErrorAt
 
 
 luaFromUserdata
@@ -386,50 +396,58 @@ luaLen a = do
 
 luaLexNumber :: BSt.ByteString -> LuaValue q s
 luaLexNumber buf = do
-    readStart $ BSt.unpack buf
+    let (value, pos) = luaLexNumberS $ BSt.unpack buf
+    if BSt.all (\c -> '\9' <= c && c <= '\13' || c == ' ') $ BSt.drop pos buf
+        then value
+        else LNil
+
+
+luaLexNumberS :: String -> (LuaValue q s, Int)
+luaLexNumberS str0 = do
+    readStart 0 str0
     where
-    readStart str = do
+    readStart !pos str = do
         case str of
-            c:rest | '\9' <= c && c <= '\13' -> readStart rest
-            ' ':rest-> readStart rest
-            '-':rest -> readPrefix (-1) rest
-            '+':rest -> readPrefix 1 rest
-            rest -> readPrefix 1 rest
-    readPrefix sign str = do
+            c:rest | '\9' <= c && c <= '\13' -> readStart (pos+1) rest
+            ' ':rest-> readStart (pos+1) rest
+            '-':rest -> readPrefix (-1) (pos+1) rest
+            '+':rest -> readPrefix 1 (pos+1) rest
+            rest -> readPrefix 1 pos rest
+    readPrefix sign !pos str = do
         case str of
-            '0':'x':rest -> readAbs sign 16 rest
-            '0':'X':rest -> readAbs sign 16 rest
-            rest -> readAbs sign 10 rest
-    readAbs sign base str = readInteger base str $ readFraction sign base
-    readFraction sign base ipart str = do
+            '0':'x':rest -> readAbs sign 16 (pos+2) rest
+            '0':'X':rest -> readAbs sign 16 (pos+2) rest
+            rest -> readAbs sign 10 pos rest
+    readAbs sign base !pos str = readInteger base pos str $
+        readFraction sign base
+    readFraction sign base ipart !pos str = do
         case str of
-            '.':rest -> readInteger base rest $
+            '.':rest -> readInteger base (pos+1) rest $
                 \i -> readExponent sign base ipart (Just i)
-            rest -> readExponent sign base ipart Nothing rest
-    readExponent sign base ipart fpart str = do
+            rest -> readExponent sign base ipart Nothing pos rest
+    readExponent sign base ipart fpart !pos str = do
         case (base, str) of
-            (10, 'e':rest) -> readExponentValue sign ipart fpart 10 rest
-            (10, 'E':rest) -> readExponentValue sign ipart fpart 10 rest
-            (16, 'p':rest) -> readExponentValue sign ipart fpart 2 rest
-            (16, 'P':rest) -> readExponentValue sign ipart fpart 2 rest
-            (_, rest) -> readEnd sign ipart fpart Nothing rest
-    readExponentValue sign ipart fpart ebase str = do
+            (10, 'e':rest) -> readExponentValue sign ipart fpart 10 (pos+1) rest
+            (10, 'E':rest) -> readExponentValue sign ipart fpart 10 (pos+1) rest
+            (16, 'p':rest) -> readExponentValue sign ipart fpart 2 (pos+1) rest
+            (16, 'P':rest) -> readExponentValue sign ipart fpart 2 (pos+1) rest
+            (_, rest) -> readEnd sign ipart fpart Nothing pos rest
+    readExponentValue sign ipart fpart ebase !pos str = do
         case str of
-            '+':rest -> readInteger 10 rest $
+            '+':rest -> readInteger 10 (pos+1) rest $
                 readExponentThen sign ipart fpart ebase True
-            '-':rest -> readInteger 10 rest $
+            '-':rest -> readInteger 10 (pos+1) rest $
                 readExponentThen sign ipart fpart ebase False
-            rest -> readInteger 10 rest $
+            rest -> readInteger 10 (pos+1) rest $
                 readExponentThen sign ipart fpart ebase True
-    readExponentThen sign ipart fpart ebase esign (enum, eden) str = do
+    readExponentThen sign ipart fpart ebase esign (enum, eden) !pos str = do
         if eden == 1
-            then LNil
+            then (LNil, pos)
             else if esign
-                then readEnd sign ipart fpart (Just (ebase^enum, 1)) str
-                else readEnd sign ipart fpart (Just (1, ebase^enum)) str
-    readEnd sign ipart@(inum, iden) fpart epart str = do
-        case str of
-            "" -> case (fpart, epart) of
+                then readEnd sign ipart fpart (Just (ebase^enum, 1)) pos str
+                else readEnd sign ipart fpart (Just (1, ebase^enum)) pos str
+    readEnd sign (inum, iden) fpart epart !pos _ = do
+        let value = case (fpart, epart) of
                 (Just (_, 1), _) | iden == 1 -> LNil
                 (Nothing, _) | iden == 1 -> LNil
                 (Nothing, Nothing) ->
@@ -441,25 +459,43 @@ luaLexNumber buf = do
                 (Just (fnum, fden), Just (enum, eden)) ->
                     LRational $ sign *
                         ((inum * fden + fnum) * enum) % (fden * eden)
-            c:rest | '\9' <= c && c <= '\13' ->
-                readEnd sign ipart fpart epart rest
-            ' ':rest -> readEnd sign ipart fpart epart rest
-            _ -> LNil
-    readInteger base str cont = do
-        readIntegerNext base (0, 1) str cont
-    readIntegerNext base (num, den) str cont = do
+        (value, pos)
+    -- readEnd sign ipart@(inum, iden) fpart epart !pos str = do
+        -- case str of
+            -- "" -> case (fpart, epart) of
+                -- (Just (_, 1), _) | iden == 1 -> LNil
+                -- (Nothing, _) | iden == 1 -> LNil
+                -- (Nothing, Nothing) ->
+                    -- LInteger $ sign * inum
+                -- (Just (fnum, fden), Nothing) ->
+                    -- LRational $ sign * (inum * fden + fnum) % fden
+                -- (Nothing, Just (enum, eden)) ->
+                    -- LRational $ sign * (inum * enum) % eden
+                -- (Just (fnum, fden), Just (enum, eden)) ->
+                    -- LRational $ sign *
+                        -- ((inum * fden + fnum) * enum) % (fden * eden)
+            -- c:rest | '\9' <= c && c <= '\13' ->
+                -- readEnd sign ipart fpart epart rest
+            -- ' ':rest -> readEnd sign ipart fpart epart rest
+            -- _ -> LNil
+    readInteger base !pos str cont = do
+        readIntegerNext base (0, 1) pos str cont
+    readIntegerNext base (num, den) !pos str cont = do
         case str of
             c:rest
                 | '0' <= c && c <= '9' -> do
                     let d = toInteger $ fromEnum c - fromEnum '0'
-                    readIntegerNext base (num*base + d, den*base) rest cont
+                    readIntegerNext base (num*base + d, den*base)
+                        (pos+1) rest cont
                 | base == 16 && 'a' <= c && c <= 'f' -> do
                     let d = toInteger $ fromEnum c - (fromEnum 'a' - 10)
-                    readIntegerNext base (num*base + d, den*base) rest cont
+                    readIntegerNext base (num*base + d, den*base)
+                        (pos+1) rest cont
                 | base == 16 && 'A' <= c && c <= 'F' -> do
                     let d = toInteger $ fromEnum c - (fromEnum 'A' - 10)
-                    readIntegerNext base (num*base + d, den*base) rest cont
-            rest -> cont (num, den) rest
+                    readIntegerNext base (num*base + d, den*base)
+                        (pos+1) rest cont
+            rest -> cont (num, den) pos rest
 
 
 luaLiftIO
@@ -662,6 +698,19 @@ luaRead :: LuaRef q s a -> LuaState q s a
 luaRead = lxRead
 
 
+luaRegistryGet
+    :: Typeable t
+    => LuaState q s (Maybe (t q s))
+luaRegistryGet = lxRegistryGet
+
+
+luaRegistrySet
+    :: Typeable t
+    => Maybe (t q s)
+    -> LuaState q s ()
+luaRegistrySet = lxRegistrySet
+
+
 luaResume
     :: LuaThread q s
     -> [LuaValue q s]
@@ -710,7 +759,7 @@ luaRunT onST onIO onError onPure act = do
             case tr of
                 Left err -> do
                     msg <- luaAsString err
-                    lxError $ LString msg
+                    lxErrorAt 0 $ LString msg
                 Right x -> return $ x
 
 
@@ -972,6 +1021,19 @@ luaTry
     :: LuaState q s t
     -> LuaState q s (Either (LuaValue q s) t)
 luaTry = lxTry
+
+
+luaTryNoTrace
+    :: LuaState q s t
+    -> LuaState q s (Either (LuaValue q s) t)
+luaTryNoTrace act = do
+    ploc <- luaAlloc Nothing
+    let lstackFrame = LuaStackFrame {
+        lsfDefinition = Nothing,
+        lsfCurrentLocation = ploc,
+        lsfUpvalues = [],
+        lsfLocals = []}
+    lxLocalStack (lstackFrame:) $ lxTry $ act
 
 
 luaTypename

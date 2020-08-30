@@ -4,6 +4,7 @@
 {-# LANGUAGE MultiParamTypeClasses #-}
 {-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE RankNTypes #-}
+{-# LANGUAGE TypeOperators #-}
 
 
 module Lua.Core (
@@ -55,6 +56,7 @@ module Lua.Core (
     lxCurrentThread,
     lxDefaultMetatable,
     lxError,
+    lxErrorAt,
     lxExtend,
     lxFinally,
     lxGet,
@@ -82,6 +84,8 @@ module Lua.Core (
     lxRawCompareEq,
     lxRawLen,
     lxRead,
+    lxRegistryGet,
+    lxRegistrySet,
     lxResume,
     lxRunHook,
     lxRunT,
@@ -120,8 +124,10 @@ import Data.Function
 import Data.Maybe
 import Data.Ratio
 import Data.STRef
+import Data.Typeable (Proxy(..))
 import Type.Reflection
 import qualified Data.ByteString.Char8 as BSt
+import qualified Data.Map.Strict as M
 import Lua.SourceRange
 import qualified Lua.Coroutine as Y
 import qualified Lua.Table as T
@@ -682,9 +688,15 @@ data LuaMetatypeWrapper q s where
         -> LuaMetatypeWrapper q s
 
 
+data LuaRegistry q s where
+    LuaRegistry :: Typeable t => t q s -> LuaRegistry q s
+
+
 data LuaEnvironment q s = LuaEnvironment {
     lenvCounter
         :: LuaRef q s Int,
+    lenvRegistry
+        :: LuaRef q s (M.Map SomeTypeRep (LuaRegistry q s)),
     lenvNilMetatable
         :: LuaRef q s (LuaMetatypeWrapper q s),
     lenvBoolMetatable
@@ -791,6 +803,7 @@ lxRunT onST onIO onError onPure (LuaState lstate) = do
     onST
         (LuaEnvironment
             <$> newSTRef 2
+            <*> newSTRef M.empty
             <*> newSTRef lxDefaultMetatable
             <*> newSTRef lxDefaultMetatable
             <*> newSTRef lxDefaultMetatable
@@ -867,11 +880,30 @@ lxYield bvals = do
         else lxError $ errWrongYield
 
 
+lxErrorAt :: Int -> LuaValue q s -> LuaState q s a
+lxErrorAt level err0 = do
+    LuaContext {
+            lctxErrHandler = errh,
+            lctxStack = stack}
+        <- lxContext
+    err1 <- case err0 of
+        LString msg | level > 0 -> do
+            case drop level $ stack of
+                [] -> return $ err0
+                LuaStackFrame {lsfCurrentLocation = ploc}:_ -> do
+                    mloc <- lxRead ploc
+                    case mloc of
+                        Just pr@(SourceRange (_, Just _)) -> do
+                            return $ LString $ BSt.pack $
+                                show pr ++ ": " ++ BSt.unpack msg
+                        _ -> return $ err0
+        _ -> return $ err0
+    err2 <- lxWithErrHandler return $ errh err1
+    lxLiftY $ Y.raise err2
+
+
 lxError :: LuaValue q s -> LuaState q s a
-lxError err = do
-    errh <- lctxErrHandler <$> lxContext
-    err' <- lxWithErrHandler return $ errh err
-    lxLiftY $ Y.raise err'
+lxError = lxErrorAt 1
 
 
 lxTry :: LuaState q s t -> LuaState q s (Either (LuaValue q s) t)
@@ -1830,3 +1862,41 @@ lxIsYieldable (LuaThread pthread) = do
         LTRunning b -> return $ b
         LTNormal b -> return $ b
         _ -> return $ True
+
+
+lxRegistrySet
+    :: Typeable t
+    => Maybe (t q s)
+    -> LuaState q s ()
+lxRegistrySet mx = do
+    preg <- lenvRegistry . lctxEnvironment <$> lxContext
+    reg1 <- lxRead preg
+    let reg2 = case mx of
+            Nothing -> do
+                M.delete trep reg1
+            Just x -> do
+                M.insert trep (LuaRegistry x) reg1
+    lxWrite preg reg2
+    where
+    trep = someTypeRep $ myproxy mx
+    myproxy :: Maybe (t q s) -> Proxy t
+    myproxy _ = Proxy
+
+
+lxRegistryGet
+    :: Typeable t
+    => LuaState q s (Maybe (t q s))
+lxRegistryGet = do
+    preg <- lenvRegistry . lctxEnvironment <$> lxContext
+    reg <- lxRead preg
+    return $ proxyCont $ \myproxy -> do
+        case M.lookup (someTypeRep myproxy) reg of
+            Just (LuaRegistry x) -> hcast x
+            Nothing -> Nothing
+    where
+    proxyCont :: (Proxy t -> Maybe (t q s)) -> Maybe (t q s)
+    proxyCont f = f Proxy
+    hcastWith :: a q s -> (a :~~: b) -> b q s
+    hcastWith x HRefl = x
+    hcast :: (Typeable a, Typeable b) => a q s -> Maybe (b q s)
+    hcast x = hcastWith x <$> eqTypeRep typeRep typeRep

@@ -453,7 +453,7 @@ do print("testing errors in __close")
   end
 
   local st, msg = xpcall(foo, debug.traceback)
-  assert(string.match(msg, "^@X"))
+  assert(string.match(msg, "^[^\n]*@X"))
   assert(string.find(msg, "%(argument 1 of func2close%)"))
   checkwarn("@Y")
 
@@ -463,7 +463,7 @@ do print("testing errors in __close")
   end
 
   local st, msg = xpcall(foo, debug.traceback)
-  assert(string.match(msg, "^@x123"))
+  assert(string.match(msg, "^[^\n]*@x123"))
   assert(string.find(msg, "%(argument 1 of func2close%)"))
   checkwarn("@x123")   -- from second call to close 'x123'
 
@@ -654,8 +654,8 @@ do
   local x = 0
   local y = 0
   co = coroutine.wrap(function ()
-    local xx <close> = func2close(function () y = y + 1; error("YYY") end)
-    local xv <close> = func2close(function () x = x + 1; error("XXX") end)
+    local xx <close> = func2close(function () y = y + 1; error("YYY", 0) end)
+    local xv <close> = func2close(function () x = x + 1; error("XXX", 0) end)
       coroutine.yield(100)
       return 200
   end)
